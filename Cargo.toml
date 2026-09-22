@@ -1,0 +1,62 @@
+# A perceptual motion engine for scrolling, built against a vendored copy of
+# bite-gpui. See README.md for the layout and how to run it.
+[package]
+name = "cool_scroll"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "Apache-2.0"
+description = "Five candidate ways of making fast scrolling feel like less of a fight."
+authors = ["Vanuan"]
+
+[workspace]
+resolver = "3"
+# The fork is a dependency, not part of this workspace: it keeps its own root
+# manifest, lockfile and toolchain pin.
+exclude = ["bite-gpui"]
+
+[lints.clippy]
+# The denials bite-gpui applies to its own crates.
+dbg_macro = "deny"
+todo = "deny"
+
+[features]
+# The headless platform, and the paint introspection the view's tests are written
+# against. Opt-in, the way `patches/gpui_parley` opts in.
+#
+# Declared as a feature rather than left in `[dev-dependencies]`, because Cargo
+# unifies a dev-dependency's features into every dev-context build — `cargo
+# test`, `cargo build --all-targets`, and any workspace member's example built
+# alongside them. `test-support` moves gpui's frame drawing onto its test path,
+# which draws every dirty window at the end of every `App::update` instead of
+# leaving frames to the platform, so a build that is not running tests should
+# not be able to pick it up by accident. The tests that need it are the ones in
+# `src/main.rs`, which is why they take `--features test-support` to run at all;
+# `src/document.rs` and `src/motion.rs` need no window and run either way.
+test-support = ["gpui/test-support"]
+
+[dependencies]
+# A checkout of Vanuan/bite-gpui, at the tip of branch bite_v1.21.0-pre
+# (d41833548a6baabf3ff9a3999c5ae358a3e9adce). To build against the remote
+# instead of the checkout, replace the path with
+# `git = "https://github.com/Vanuan/bite-gpui", rev = "d41833548a6baabf3ff9a3999c5ae358a3e9adce"`;
+# the [patch.crates-io] table below is needed either way.
+gpui = { path = "bite-gpui/crates/gpui", default-features = false, features = ["platform"] }
+# Resolved to patches/gpui_animotion by [patch.crates-io].
+gpui_animotion = "0.7.0"
+# A copy of this fork's `gpui_parley`, which is what shapes the document's text.
+# Depended on with no features, so its own `test-support` — which activates its
+# `gpui` dependency and puts gpui on the test draw path — never reaches a build of
+# this app. Its injection test is run on its own:
+# `cargo test -p gpui_parley --features test-support`.
+gpui_parley = { path = "patches/gpui_parley" }
+
+# A patch table is not inherited, so the entries that reach gpui's dependency
+# tree are mirrored from bite-gpui's own root manifest, pinned to the revisions
+# it locks. The gpui-unofficial shim and the gpui_animotion patch live here
+# rather than in the fork, so the checkout stays unmodified.
+[patch.crates-io]
+gpui-unofficial = { path = "patches/gpui_unofficial" }
+gpui_animotion = { path = "patches/gpui_animotion" }
+calloop = { git = "https://github.com/zed-industries/calloop", rev = "eb6b4fd17b9af5ecc226546bdd04185391b3e265" }
+async-task = { git = "https://github.com/smol-rs/async-task", rev = "b4486cd71e4e94fbda54ce6302444de14f4d190e" }

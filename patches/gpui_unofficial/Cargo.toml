@@ -1,0 +1,13 @@
+[package]
+name = "gpui-unofficial"
+version = "1.21.0"
+edition = "2024"
+publish = false
+license = "Apache-2.0"
+description = "Resolves the published `gpui-unofficial` dependency to this fork's `gpui`."
+
+[lib]
+path = "src/gpui_unofficial.rs"
+
+[dependencies]
+gpui = { path = "../../bite-gpui/crates/gpui" }

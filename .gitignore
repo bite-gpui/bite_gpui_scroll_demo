@@ -1,0 +1,8 @@
+# cargo's build output — this tree keeps gigabytes here.
+/target
+
+# A checkout of Vanuan/bite-gpui. It is a dependency rather than part of this
+# repository: pristine, pinned by revision, and replaceable by a `git =`
+# dependency (see the comment in Cargo.toml). Its own build output lives inside
+# it, and it is a repository of its own, so it is left alone here.
+/bite-gpui

@@ -1,0 +1,4 @@
+# Matches bite-gpui's own pin: the fork is built with this compiler, so the app
+# that links it is too.
+[toolchain]
+channel = "1.98.1"

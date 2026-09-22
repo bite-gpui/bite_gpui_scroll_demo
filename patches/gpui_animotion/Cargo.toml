@@ -1,0 +1,30 @@
+# A local patch of the published `gpui_animotion` crate.
+#
+# Identical to gpui_animotion 0.7.0 on crates.io except that `src/element.rs`
+# is adapted to this fork's `Element` trait, which has no `inspector_id`
+# parameter (upstream gpui passes one). The workspace's `[patch.crates-io]`
+# table points `gpui_animotion = "0.7"` here, so the dependency is used as
+# published and only the incompatible file is maintained locally.
+#
+# The manifest keeps the upstream package name and version, because the patch
+# has to satisfy the version requirement. The dependency on
+# `gpui-unofficial` is likewise left as upstream wrote it and is redirected to
+# this fork's `gpui` by `patches/gpui_unofficial`.
+#
+# Examples and dev-dependencies are dropped: they build the upstream crate's own
+# test harness, which is not ours to keep working.
+[package]
+name = "gpui_animotion"
+version = "0.7.0"
+edition = "2024"
+publish = false
+description = "Declarative property animation engine for GPUI (local patch for bite-gpui)"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/astrimid/gpui_animotion"
+
+[lib]
+name = "gpui_animotion"
+path = "src/lib.rs"
+
+[dependencies]
+gpui = { version = "1.16", package = "gpui-unofficial" }

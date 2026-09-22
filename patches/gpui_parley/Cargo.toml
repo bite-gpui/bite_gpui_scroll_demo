@@ -1,0 +1,65 @@
+# A local copy of this fork's `gpui_parley`, moved out of the checkout so it can
+# be modified here without the checkout losing its pristine-ness.
+#
+# `src/` is the fork's, unedited. The fonts it embeds are read from this
+# workspace's `assets/fonts/`, which is exactly where the path in the source
+# already points (`../../../assets/fonts/...` resolves the same way from
+# `patches/gpui_parley/src/` as from `crates/gpui_parley/src/`), so nothing in
+# the library had to change. Only this manifest — which inherits
+# `edition.workspace = true`, `[lints] workspace = true` and every dependency
+# from the fork's workspace — is rewritten, with the versions the fork's
+# workspace resolves at `d418335`.
+#
+# Unlike `patches/gpui_unofficial` and `patches/gpui_animotion`, this is not a
+# `[patch.crates-io]` target: the crate is not published, so it is depended on by
+# path, and it is a member of this workspace rather than carved out of it, so its
+# own unit tests run with `cargo test` and its example stays buildable.
+#
+# The `demo` / `test-support` split is the fork's and is load-bearing. A
+# dev-dependency's features are unified into the example build, and
+# `test-support` switches `App`'s effect-flush path to drawing every dirty window
+# at the end of every `App::update` instead of leaving frames to the platform's
+# frame requests — which would make the example render once per input event. The
+# app therefore depends on this crate with no features at all, and `test-support`
+# is opt-in per invocation:
+#
+#     cargo test -p gpui_parley --features test-support
+[package]
+name = "gpui_parley"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+description = "A Parley-backed TextSystem for GPUI (local copy of bite-gpui's gpui_parley)"
+
+[lints.clippy]
+# The denials the fork applies to its own crates, inlined: `workspace = true`
+# would resolve against this workspace's lint table instead of the fork's.
+dbg_macro = "deny"
+todo = "deny"
+
+[lib]
+path = "src/gpui_parley.rs"
+
+[dependencies]
+anyhow = "1.0.86"
+gpui = { path = "../../bite-gpui/crates/gpui", default-features = false, optional = true }
+gpui_engine = { path = "../../bite-gpui/crates/gpui_engine" }
+gpui_shared_string = { path = "../../bite-gpui/crates/gpui_shared_string" }
+gpui_types = { path = "../../bite-gpui/crates/gpui_types" }
+parley = "0.11"
+skrifa = "0.44"
+smallvec = { version = "1.6", features = ["union", "const_new"] }
+tiny-skia = "0.11"
+
+[features]
+demo = ["dep:gpui", "gpui/platform"]
+test-support = ["dep:gpui", "gpui/platform", "gpui/test-support"]
+
+[[example]]
+name = "parley_demo"
+required-features = ["demo"]
+
+[[test]]
+name = "injection"
+required-features = ["test-support"]
