@@ -2,9 +2,61 @@
 
 A perceptual motion engine for scrolling: five candidate ways of making fast
 scrolling feel like less of a fight, drawn over the same text so they can be
-compared by eye. Run it, arm an effect in the panel in the top-right, and scroll.
+compared by eye.
 
-Scroll with the wheel or trackpad, or drag the document for a flick.
+![Scrolling the document with Parallax Horizon armed, in the vector mode](assets/demo.gif)
+
+*War and Peace, scrolled with Parallax Horizon armed, in the vector mode. The
+readout in the bottom-left is the app's own: 29.3ms for that frame, and 2.9ms of
+that spent building the elements.*
+
+## What this is
+
+A desktop app you scroll. Arm one of five effects in the panel on the right, then
+move the document with a wheel, a trackpad, or a drag. Each effect is a perceptual
+transform applied to the document as it moves — the text tilts, bulges, shrinks or
+fades out of your way — and the question behind all of them is what fast scrolling
+should *look* like when it stops fighting your hand.
+
+The panel's first control is not one of the effects. It chooses how the document is
+*painted*, and that turned out to matter as much as the effects do: the same text in
+the same window can cost an order of magnitude more to draw in one of its three
+modes than in another.
+
+## Quickstart
+
+    git clone https://github.com/bite-gpui/bite_gpui_scroll_demo.git cool_scroll
+    cd cool_scroll
+    git clone --branch path-pass-cost https://github.com/Vanuan/bite-gpui.git bite-gpui
+    cargo run --release
+
+The second clone lands *inside* the app's directory, and it is not optional:
+`Cargo.toml` takes GPUI from `bite-gpui/` by path, so nothing builds without it. It
+has to be on `path-pass-cost`, the branch this app is written against — the fork's
+own changes are described under **`bite-gpui/`** below.
+
+The toolchain is pinned to the fork's (`rust-toolchain.toml`), and the first build
+compiles the whole GPUI stack, so give it a couple of minutes — several more for a
+release build. Release is worth it: this is a motion demo, and in a debug build most
+of each frame goes on laying out and shaping the lines on screen.
+
+## What it is built on
+
+[**bite-gpui**](https://bite-gpui.github.io/) — *stop forking, start swapping* — a
+modular re-architecture of GPUI, its stack split into five crates (`gpui_types`,
+`gpui_engine`, `gpui_platform`, `gpui_authoring`, `gpui_runtime`) under the familiar
+`gpui` facade, so that a layer can be replaced on its own rather than the whole thing
+forked. Its architecture, crate layout and benchmarks are on that site. It is not
+affiliated with upstream GPUI or Zed.
+
+This app is the facade, plus two of the swaps it is built for:
+
+- **A text system**: Parley for shaping and measuring, Skrifa for glyph outlines,
+  tiny-skia for their coverage — installed with `application().with_text_system(...)`
+  from this repository's copy of the fork's `gpui_parley`.
+- **A frame pipeline**: the fork's `ThrottledPipeline`, which `FRAME_CAP` arms.
+
+## The five effects
 
 - **1. Parallax Horizon**, **2. Rotating Barrel** and **3. Black Hole** are
   distortion fields: they trade legibility for a sense of travel.
@@ -12,8 +64,10 @@ Scroll with the wheel or trackpad, or drag the document for a flick.
 - **5. Altitude** sidesteps the problem instead, shrinking the document the way
   ground recedes from a plane. It is mutually exclusive with the others.
 
-The panel's first control is not one of the five. It chooses how the document
-itself is painted, among three modes that are the same lines drawn three ways:
+## The three modes
+
+The selector decides how the document is painted. All three modes draw the same
+lines:
 
 - **Text** sets every line at the size the transform asks for, and that size stays
   *exact*: every glyph's position, and the width of the line, is what the transform
@@ -38,7 +92,7 @@ the bottleneck: switching modes changes nothing about the motion.
 ## Layout
 
     src/           the app
-    assets/        the corpus, and the font the text system shapes with
+    assets/        the corpus, the font the text system shapes with, and the demo clip
     patches/       local copies of crates the fork cannot be used for as-is
     bite-gpui/     the GPUI fork this builds against
 
@@ -119,22 +173,7 @@ they come: a shim that resolves the published `gpui-unofficial` to the fork's
 trait, and `gpui_parley` — which the app *uses* rather than patches, and keeps
 here so that changing it is possible. See `patches/README.md`.
 
-## Running
-
-`bite-gpui/` is not part of this repository — it is a clone of `Vanuan/bite-gpui`,
-and it has to be here because `Cargo.toml` takes GPUI from it by path. Clone it
-beside this tree, on the branch this one is written against:
-
-    git clone --branch path-pass-cost https://github.com/Vanuan/bite-gpui.git bite-gpui
-
-Then:
-
-    cargo run --release
-
-The toolchain is pinned to the fork's (`rust-toolchain.toml`), and the first
-build compiles the GPUI stack, so give it a couple of minutes — several more for
-a release build. Release is worth it: this is a motion demo, and in a debug build
-most of each frame goes on laying out and shaping the lines on screen.
+## What a frame costs
 
 The readout in the bottom-left says where a frame goes: `Frame:` is the interval
 between one frame and the next, which is what the display actually got, and
