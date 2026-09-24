@@ -36,10 +36,12 @@ todo = "deny"
 test-support = ["gpui/test-support"]
 
 [dependencies]
-# A checkout of Vanuan/bite-gpui, at the tip of branch bite_v1.21.0-pre
-# (d41833548a6baabf3ff9a3999c5ae358a3e9adce). To build against the remote
-# instead of the checkout, replace the path with
-# `git = "https://github.com/Vanuan/bite-gpui", rev = "d41833548a6baabf3ff9a3999c5ae358a3e9adce"`;
+# A checkout of bite-gpui/bite-gpui on the branch
+# bite_v1.21.0-pre-path-pass-cost — that branch, which is the fork's version line
+# for GPUI 1.21, plus this app's four commits, the last of which is
+# 33d8929fba754ea2940865f0dad65ec91bd5f090. To build against the remote instead of
+# the checkout, replace the path with
+# `git = "https://github.com/bite-gpui/bite-gpui", rev = "33d8929fba754ea2940865f0dad65ec91bd5f090"`;
 # the [patch.crates-io] table below is needed either way.
 gpui = { path = "bite-gpui/crates/gpui", default-features = false, features = ["platform"] }
 # Resolved to patches/gpui_animotion by [patch.crates-io].

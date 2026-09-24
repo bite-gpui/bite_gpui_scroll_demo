@@ -17,7 +17,10 @@
 # in the library had to change. Its manifest inherits
 # `edition.workspace = true`, `[lints] workspace = true` and every dependency
 # from the fork's workspace, so that is rewritten here, with the versions the
-# fork's workspace resolves at `d418335`.
+# fork's workspace resolves at `d418335`. That is where this copy comes from; the
+# fork's own `gpui_parley` has since moved on — it carries its fonts inside the
+# crate now, which this copy has no reason to, since it can reach this tree's
+# `assets/` — so do not expect the two to match file for file.
 #
 # Unlike `patches/gpui_unofficial` and `patches/gpui_animotion`, this is not a
 # `[patch.crates-io]` target: the crate is not published, so it is depended on by

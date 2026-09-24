@@ -27,13 +27,15 @@ modes than in another.
 
     git clone https://github.com/bite-gpui/bite_gpui_scroll_demo.git cool_scroll
     cd cool_scroll
-    git clone --branch path-pass-cost https://github.com/Vanuan/bite-gpui.git bite-gpui
+    git clone --branch bite_v1.21.0-pre-path-pass-cost https://github.com/bite-gpui/bite-gpui.git bite-gpui
     cargo run --release
 
 The second clone lands *inside* the app's directory, and it is not optional:
-`Cargo.toml` takes GPUI from `bite-gpui/` by path, so nothing builds without it. It
-has to be on `path-pass-cost`, the branch this app is written against — the fork's
-own changes are described under **`bite-gpui/`** below.
+`Cargo.toml` takes GPUI from `bite-gpui/` by path, so nothing builds without it. The
+branch is this app's own work on top of `bite_v1.21.0-pre`, the fork's version line
+for GPUI 1.21 — which is the part of the branch name that matters, since the fork
+keeps a line per version — and the four commits it carries are described under
+**`bite-gpui/`** below.
 
 The toolchain is pinned to the fork's (`rust-toolchain.toml`), and the first build
 compiles the whole GPUI stack, so give it a couple of minutes — several more for a
@@ -147,25 +149,34 @@ unmounted or dropped once they have settled, so the app goes quiet at rest. The
 panel's transitions (the switch knob, and controls dimming as they are armed)
 come from `gpui_animotion` as well.
 
-**`bite-gpui/`** is a checkout of `Vanuan/bite-gpui`, branched from the tip of
-`bite_v1.21.0-pre` (`d418335`) at **`path-pass-cost`**, which carries this
-repository's three changes to it and nothing else. All three are about what the
-vector path pass costs and are meant for the fork rather than for here — as
-three commits, because the first is a knob for measuring what the pass's
-multisampling costs (`ZED_PATH_SAMPLE_COUNT`), the second is the saving that knob
-made visible (`ZED_PATH_DIRECT`, the pass skipping the target and composite it no
-longer needs), and the third drops the per-corner `ContentMask` a `PathVertex`
-has carried since before the renderers stopped reading it, which halves the
-vertex. The first two are in `gpui_wgpu`; the third is in `gpui_engine`. See the
-section on the vector mode above.
+**`bite-gpui/`** is a checkout of `bite-gpui/bite-gpui`, on the branch
+**`bite_v1.21.0-pre-path-pass-cost`** — this repository's four commits, branched from
+the tip of the fork's `bite_v1.21.0-pre` (`7be9200`), its version line for GPUI 1.21.
+They are meant for the fork rather than for here, and each stands on its own:
 
-    git -C bite-gpui push -u origin path-pass-cost
+- `ZED_PATH_SAMPLE_COUNT`, a knob for measuring what the vector path pass's
+  multisampling costs;
+- `ZED_PATH_DIRECT`, the saving that knob made visible: with nothing to resolve, the
+  pass draws straight into the frame instead of into a target the size of the window
+  and compositing it back;
+- the per-corner `ContentMask` a `PathVertex` has carried since before the renderers
+  stopped reading it, dropped — which halves the vertex, along with the vendored copy
+  of `scene.rs` the Apple build script hands to cbindgen;
+- the size a glyph is *rasterized* at rounded onto a lattice, while the size it is
+  *laid out* at stays exact — which is the difference between 37.6ms and 13.9ms of a
+  scrolling frame in the text mode above.
 
-The checkout sits on that branch, so `git status` there is clean and each commit
-is independently buildable — the second is the one to stop at if the knob is not
+The first two are in `gpui_wgpu`, the third in `gpui_engine` and `gpui_apple`'s
+vendored copy of it, the fourth in `gpui_authoring`. The branch is pushed, so there
+is nothing to do to it but open it:
+
+    https://github.com/bite-gpui/bite-gpui/pull/new/bite_v1.21.0-pre-path-pass-cost
+
+The checkout sits on that branch, so `git status` there is clean and each commit is
+independently buildable — the second is the one to stop at if the knob is not
 wanted. It is a dependency rather than a workspace member, so it can also be
-replaced by a `git` dependency (see the comment in `Cargo.toml`) or built against
-a local edit, without anything of the app's riding along.
+replaced by a `git` dependency (see the comment in `Cargo.toml`) or built against a
+local edit, without anything of the app's riding along.
 
 **`patches/`** holds local copies of the three crates this app cannot take as
 they come: a shim that resolves the published `gpui-unofficial` to the fork's
