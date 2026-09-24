@@ -18,7 +18,7 @@ use anyhow::{Context as _, Result};
 use gpui_engine::{
     Font, FontId, FontMetrics, FontRun, GlyphId, LineLayout, LineLayoutIndex, LineWrapper,
     LineWrapperHandle, MissingGlyphReports, RenderGlyphParams, ShapedGlyph, ShapedRun,
-    TextRenderingMode, WrapBoundary, WrappedLineLayout, font,
+    TextRenderingMode, WrapBoundary, WrappedLineLayout,
 };
 
 pub use gpui_engine::{PlatformTextSystem, TextSystem};
@@ -85,7 +85,13 @@ pub type GlyphTriangles = Vec<[Point<Pixels>; 3]>;
 pub fn font_context() -> parley::FontContext {
     let mut collection = parley::fontique::Collection::new(parley::fontique::CollectionOptions {
         shared: false,
-        system_fonts: false,
+        // The host's fonts, through fontique's platform backend — fontconfig, on a
+        // Linux desktop. Without them a family named here is only one of the fonts
+        // compiled in, and a glyph the chosen family has not got has nowhere to fall
+        // back to; with them, a stack resolves the way the desktop's own font
+        // configuration says it should, which is what makes naming a stack
+        // worthwhile.
+        system_fonts: true,
     });
     for data in [
         FONT_DATA,
@@ -114,25 +120,12 @@ fn map_style(style: gpui_engine::FontStyle) -> FontStyle {
     }
 }
 
-/// Returns the `font_id` of the run that covers `byte`, if any.
-fn font_id_for_byte(runs: &[FontRun], byte: usize) -> Option<FontId> {
-    let mut offset = 0;
-    for run in runs {
-        if byte < offset + run.len {
-            return Some(run.font_id);
-        }
-        offset += run.len;
-    }
-    runs.last().map(|run| run.font_id)
-}
-
 /// Converts a Parley layout into a GPUI [`LineLayout`].
 fn convert_layout(
     layout: &parley::Layout<[u8; 4]>,
-    runs: &[FontRun],
-    default_font_id: FontId,
     font_size: Pixels,
     len: usize,
+    registry: &Mutex<FontRegistry>,
 ) -> LineLayout {
     let mut result = LineLayout {
         font_size,
@@ -143,6 +136,7 @@ fn convert_layout(
         len,
     };
 
+    let mut registry = registry.lock().unwrap();
     for line in layout.lines() {
         let metrics = line.metrics();
         result.ascent = px(metrics.ascent);
@@ -150,8 +144,9 @@ fn convert_layout(
 
         for item in line.items() {
             if let PositionedLayoutItem::GlyphRun(glyph_run) = item {
-                let run_byte = glyph_run.run().text_range().start;
-                let font_id = font_id_for_byte(runs, run_byte).unwrap_or(default_font_id);
+                // The face the shaper used for these glyphs — not the one that was
+                // asked for, which a fallback glyph would not be in.
+                let font_id = registry.resolve_face(glyph_run.run().font());
                 let mut glyphs = Vec::new();
                 let mut offset = glyph_run.offset();
                 let baseline = glyph_run.baseline();
@@ -840,28 +835,58 @@ fn pixels(point: lyon::math::Point, units_per_em: f32) -> Point<Pixels> {
     }
 }
 
-/// Maps GPUI [`Font`]s to stable [`FontId`]s and back.
+/// Maps GPUI [`Font`]s to stable [`FontId`]s and back, and records the faces the
+/// shaper chose along the way.
+///
+/// Both get ids from the one counter. The second is what makes a fallback chain safe
+/// to name: a glyph the requested family has not got is shaped from whatever the
+/// stack has next, and the glyph ids in that run only mean anything to *that* face —
+/// so it is recorded as the shaper makes it, and rasterization reads it back rather
+/// than resolving the requested family a second time and getting a different answer.
 #[derive(Default)]
 struct FontRegistry {
     ids_by_font: HashMap<Font, FontId>,
     fonts_by_id: HashMap<FontId, Font>,
+    ids_by_face: HashMap<(u64, u32), FontId>,
+    faces_by_id: HashMap<FontId, (parley::fontique::Blob<u8>, u32)>,
     next_id: usize,
 }
 
 impl FontRegistry {
+    fn allocate_id(&mut self) -> FontId {
+        let id = FontId(self.next_id);
+        self.next_id += 1;
+        id
+    }
+
     fn resolve(&mut self, font: &Font) -> FontId {
         if let Some(id) = self.ids_by_font.get(font) {
             return *id;
         }
-        let id = FontId(self.next_id);
-        self.next_id += 1;
+        let id = self.allocate_id();
         self.ids_by_font.insert(font.clone(), id);
         self.fonts_by_id.insert(id, font.clone());
         id
     }
 
+    /// The id for the face the shaper picked, registering it if it is new.
+    fn resolve_face(&mut self, face: &parley::FontData) -> FontId {
+        let key = (face.data.id(), face.index);
+        if let Some(id) = self.ids_by_face.get(&key) {
+            return *id;
+        }
+        let id = self.allocate_id();
+        self.ids_by_face.insert(key, id);
+        self.faces_by_id.insert(id, (face.data.clone(), face.index));
+        id
+    }
+
     fn font_for_id(&self, id: FontId) -> Option<Font> {
         self.fonts_by_id.get(&id).cloned()
+    }
+
+    fn face_for_id(&self, id: FontId) -> Option<(parley::fontique::Blob<u8>, u32)> {
+        self.faces_by_id.get(&id).cloned()
     }
 }
 
@@ -983,9 +1008,14 @@ impl ParleyPlatformTextSystem {
         Some((face.load(None)?, face.index()))
     }
 
+    /// The face to draw an id with: the one the shaper used for it, if it shaped
+    /// anything with it, and otherwise the family it was asked for, resolved.
     fn font_data_for_id(&self, id: FontId) -> Option<(parley::fontique::Blob<u8>, u32)> {
-        self.font_for_id(id)
-            .and_then(|font| self.font_data_for(&font))
+        if let Some(face) = self.font_registry.lock().unwrap().face_for_id(id) {
+            return Some(face);
+        }
+        let font = self.font_for_id(id)?;
+        self.font_data_for(&font)
     }
 
     /// The hinting instance for a face at a device size, built once and reused.
@@ -1089,9 +1119,10 @@ impl ParleyPlatformTextSystem {
         let mut font_context = self.font_context.lock().unwrap();
         let mut layout_context = self.layout_context.lock().unwrap();
 
-        // Which runs name a family the shaper has. One it has not is left to the
-        // default above rather than pushed, so asking for a font that is not loaded
-        // draws the compiled-in one instead of nothing at all — and this has to be
+        // Which runs name something the shaper can resolve. A stack is expected to
+        // end in a generic and so to resolve itself, and is taken as given; a single
+        // name that is not a family anywhere is the one case worth refusing, since
+        // shaping it would give an empty line rather than a fallback. This has to be
         // asked before the builder is made, because the builder takes the font
         // context for the rest of the function.
         let families: Vec<Option<String>> = runs
@@ -1099,7 +1130,10 @@ impl ParleyPlatformTextSystem {
             .map(|run| {
                 self.font_for_id(run.font_id)
                     .map(|font| font.family.to_string())
-                    .filter(|family| font_context.collection.family_by_name(family).is_some())
+                    .filter(|family| {
+                        family.contains(',')
+                            || font_context.collection.family_by_name(family).is_some()
+                    })
             })
             .collect();
 
@@ -1114,9 +1148,12 @@ impl ParleyPlatformTextSystem {
                 // The run's own family, which is what makes a family loaded at
                 // runtime the one the text is shaped in.
                 if let Some(family) = family {
+                    // Pushed as a source string, not as one name, so a whole stack is
+                    // what the shaper is handed and it resolves the list the way the
+                    // desktop's own font configuration says it should.
                     builder.push(
-                        StyleProperty::FontFamily(FontFamily::from(parley::FontFamilyName::Named(
-                            std::borrow::Cow::Owned(family.clone()),
+                        StyleProperty::FontFamily(FontFamily::Source(std::borrow::Cow::Owned(
+                            family.clone(),
                         ))),
                         byte..end,
                     );
@@ -1140,12 +1177,11 @@ impl ParleyPlatformTextSystem {
         runs: &[FontRun],
         wrap_width: Pixels,
     ) -> (LineLayout, SmallVec<[WrapBoundary; 1]>) {
-        let default_font_id = self.resolve_font(&font(FONT_FAMILY));
         let mut layout = self.build_layout(text, font_size, runs);
 
         layout.break_all_lines(None);
         layout.align(Alignment::Start, AlignmentOptions::default());
-        let unwrapped = convert_layout(&layout, runs, default_font_id, font_size, text.len());
+        let unwrapped = convert_layout(&layout, font_size, text.len(), &self.font_registry);
 
         layout.break_all_lines(Some(wrap_width.0));
         let mut boundaries = SmallVec::new();
@@ -1168,7 +1204,9 @@ impl PlatformTextSystem for ParleyPlatformTextSystem {
     /// It is the same collection [`Self::font_data_for`] asks when a glyph is
     /// rasterized, so a font loaded here is shaped and cut from its own bytes, and
     /// nothing has to be told what it is: family, weight and slant all come out of
-    /// the font.
+    /// the font. The collection already carries the host's fonts (fontique's
+    /// platform backend), so this is additive to them rather than instead of them,
+    /// and a family named by a run may be one of either.
     fn add_fonts(&self, fonts: Vec<std::borrow::Cow<'static, [u8]>>) -> Result<()> {
         let mut context = self.font_context.lock().unwrap();
         for data in fonts {
@@ -1261,11 +1299,10 @@ impl PlatformTextSystem for ParleyPlatformTextSystem {
     }
 
     fn layout_line(&self, text: &str, font_size: Pixels, runs: &[FontRun]) -> LineLayout {
-        let default_font_id = self.resolve_font(&font(FONT_FAMILY));
         let mut layout = self.build_layout(text, font_size, runs);
         layout.break_all_lines(None);
         layout.align(Alignment::Start, AlignmentOptions::default());
-        convert_layout(&layout, runs, default_font_id, font_size, text.len())
+        convert_layout(&layout, font_size, text.len(), &self.font_registry)
     }
 
     fn recommended_rendering_mode(
@@ -1358,8 +1395,16 @@ mod tests {
         assert_eq!(layout.len, 11);
         assert!(layout.width > px(0.0));
         assert!(!layout.runs.is_empty());
-        assert!(layout.runs.iter().any(|run| run.font_id == regular_id));
-        assert!(layout.runs.iter().any(|run| run.font_id == bold_id));
+        // A run carries the face the shaper actually used, not the id of the family
+        // it was asked for, so the two weights come back as two faces of their own
+        // rather than as the two ids they were requested with.
+        let mut faces: Vec<_> = layout.runs.iter().map(|run| run.font_id).collect();
+        faces.dedup();
+        assert_eq!(
+            faces.len(),
+            2,
+            "the two weights should be shaped from two faces, not {faces:?}"
+        );
     }
 
     #[test]

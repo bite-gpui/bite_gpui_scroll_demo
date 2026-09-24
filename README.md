@@ -94,7 +94,7 @@ the bottleneck: switching modes changes nothing about the motion.
 ## Layout
 
     src/           the app
-    assets/        the corpus, the fonts the text system can be set in, and the demo clip
+    assets/        the corpus, any extra fonts to set the text in, and the demo clip
     patches/       local copies of crates the fork cannot be used for as-is
     bite-gpui/     the GPUI fork this builds against
 
@@ -121,19 +121,25 @@ thing is ~90,000 lines, and the cost is linear in the text). Point
 The measuring and the rendering both go through Parley — Skrifa for the glyph
 outlines, tiny-skia for their coverage — because `main` installs a copy of the
 fork's `gpui_parley` with `application().with_text_system(...)`. Worth knowing
-what that crate is: it compiles in IBM Plex Sans and takes any other font the app
-hands it, shaping and rasterizing from the shaper's own font database, so a font is
-tried by dropping it under `assets/fonts/` and naming it:
+what that crate is: it reads its fonts from the shaper's own font database, which
+now includes the host's, so the document can be set in any family this machine
+has. `COOL_SCROLL_FONT` takes a family, or a whole stack — a comma-separated list
+tried in order, the shape a desktop's font configuration is written in:
 
-    COOL_SCROLL_FONT="Liberation Serif" cargo run --release
+    COOL_SCROLL_FONT="DejaVu Serif, Liberation Serif, serif" cargo run --release
 
-A face's family, weight and slant are read out of the font itself, so nothing has
-to be told what a file is, and a name nothing was loaded for falls back to the
-compiled-in family rather than drawing nothing. That is enough to see what these
-effects read like in a serif, or a mono, or whatever is to hand. It exists to prove
-GPUI's text SPI can be implemented out of tree, not to be a general text stack —
-which is why it lives in `patches/` as a copy, rather than being depended on where
-it is.
+Left alone it is set in the stack a GNOME desktop reaches for, ending in the
+generic that always resolves, so it comes out in Adwaita Sans — or Cantarell, or
+whatever comes next — as the machine allows. A face's family, weight and slant are
+read out of the font itself, so nothing has to be told what a file is; a character
+none of the stack's families can draw is shaped from one that can, and drawn from
+whatever face the shaper actually used; and a name nothing was loaded for falls
+back to the compiled-in family rather than drawing nothing. Dropping a font under
+`assets/fonts/` still loads it alongside the host's, which is what makes a face
+that is not installed anywhere nameable. That is enough to see what these effects
+read like in a serif, or a mono, or whatever is to hand. It exists to prove GPUI's
+text SPI can be implemented out of tree, not to be a general text stack — which is
+why it lives in `patches/` as a copy, rather than being depended on where it is.
 
 The **vector** mode is the other route through the same crate: Parley lays the
 line out, then `ParleyTextSystem::glyph_triangles` tessellates a glyph's outline

@@ -7,13 +7,21 @@
 # of every frame, so the un-cached version built thousands a frame where thirty
 # would do, and that was a third of the cost of rasterizing a text frame here
 # (`cargo run --release -p gpui_parley --example raster_cost` measures it, and
-# prints where the rest of the cost goes). The second is that `add_fonts` loads a
-# face into the shaper's own font database and `build_layout` shapes in the family
-# it is asked for, so the app can try a font by dropping it under `assets/fonts/`
-# and naming it — and so that the face rasterized is the one that was shaped, since
-# both are chosen by that one database, out of the family, weight and slant read
-# from the font. The third is one clippy nit in the crate's own tests, which this
-# workspace lints more strictly than the fork's does.
+# prints where the rest of the cost goes).
+#
+# The second is that shaping and rasterization both read the shaper's own font
+# database rather than a table in the crate. That database holds the host's fonts
+# (fontique's platform backend — fontconfig, on a Linux desktop) as well as
+# everything `add_fonts` is handed, so a family named here can be one this machine
+# has, and a whole *stack* of them can be named the way a desktop's font
+# configuration is written: `build_layout` pushes the list as a source string and
+# fontique resolves it in order. And because a stack may resolve to more than one
+# face — a glyph no family in it can draw is shaped from whatever can — the face the
+# shaper actually used for a run is recorded as that run is converted, so the face
+# rasterized is the one that was shaped, the one the run's glyph ids belong to.
+#
+# The third is one clippy nit in the crate's own tests, which this workspace lints
+# more strictly than the fork's does.
 #
 # The fonts it embeds are read from this
 # workspace's `assets/fonts/`, which is exactly where the path in the source

@@ -352,7 +352,7 @@ fn main() {
         println!(
             "{name:<11} {:>9} {:>12} {:>12.1?} {:>12.1?}",
             atlas.len(),
-            misses / warm_frames as usize,
+            misses / warm_frames,
             layout_time / warm_frames as u32,
             raster_time / warm_frames as u32,
         );

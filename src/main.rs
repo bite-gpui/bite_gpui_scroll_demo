@@ -47,7 +47,7 @@ use gpui::{
 use gpui_animotion::{
     AnimotionExt as _, Interpolate as _, SpringParams, VelocityTracker, prop, spring, tween,
 };
-use gpui_parley::{FONT_FAMILY, ParleyTextSystem, ParleyTextSystemExt as _};
+use gpui_parley::{ParleyTextSystem, ParleyTextSystemExt as _};
 
 use document::{BASE_SPACING, CONTENT_WIDTH, Line, Style};
 use motion::{Effect, FRAMES_PER_SECOND, IntensitySpec, Motion, Settings, intensity_spec};
@@ -1106,7 +1106,7 @@ fn readout(
         // 12px/1.5, per the prototype's `#hud`.
         .text_size(px(12.0))
         .line_height(relative(1.5))
-        .font_family("monospace")
+        .font_family(MONO_FONT)
         .text_color(grey(1.0, 0.5))
         .child(match mode {
             // The triangle count is the vector mode's whole per-frame CPU work
@@ -1585,21 +1585,39 @@ fn frame_cap_interval() -> Option<Duration> {
     FRAME_CAP.map(|cap| Duration::from_secs_f32(1.0 / cap as f32))
 }
 
-/// The environment variable that names the family the document is set in.
+/// The environment variable that names the family, or the stack, the document is set
+/// in.
 ///
-/// The text system compiles one family in and takes others at runtime, so naming a
-/// family whose face is under `assets/fonts/` is all it takes to try a font —
-/// nothing is rebuilt, and nothing has to be told what the face is: its family,
-/// weight and slant are read out of the font itself.
+/// A stack is a comma-separated list tried in order — the shape a desktop's font
+/// configuration is written in — and it should end in a generic so that something
+/// always resolves. The text system loads the host's own fonts, so a family here can
+/// be one this machine has:
+///
+///     COOL_SCROLL_FONT="DejaVu Serif, Liberation Serif, serif" cargo run --release
+///
+/// Nothing is rebuilt to try one, and nothing has to be told what a face is: its
+/// family, weight and slant are read out of the font itself.
 const FONT_VAR: &str = "COOL_SCROLL_FONT";
 
-/// The family the document is set in.
+/// The stack the document is set in when `FONT_VAR` says nothing.
+///
+/// The fonts a GNOME desktop reaches for, in the order it reaches for them, ending in
+/// the generic that always resolves. Since the host's fonts are loaded, this is
+/// Adwaita Sans on a machine that has the GNOME fonts and whatever comes next on one
+/// that does not — rather than a font compiled into the app.
+const DEFAULT_FONT: &str =
+    "Adwaita Sans, Cantarell, Inter, Ubuntu, DejaVu Sans, Liberation Sans, sans-serif";
+
+/// The stack the readout is set in: the order a GNOME terminal would use.
+const MONO_FONT: &str = "Source Code Pro, Fira Mono, DejaVu Sans Mono, Liberation Mono, monospace";
+
+/// The family or stack the document is set in.
 fn document_family() -> SharedString {
     static FAMILY: OnceLock<SharedString> = OnceLock::new();
     FAMILY
         .get_or_init(|| match std::env::var(FONT_VAR) {
             Ok(family) if !family.trim().is_empty() => SharedString::from(family),
-            _ => SharedString::from(FONT_FAMILY),
+            _ => SharedString::from(DEFAULT_FONT),
         })
         .clone()
 }
@@ -1700,6 +1718,7 @@ fn main() {
 mod tests {
     use super::*;
     use gpui::{Entity, Modifiers, Point, TestAppContext, TouchPhase, VisualTestContext};
+    use gpui_parley::FONT_FAMILY;
 
     /// A short corpus, so most tests do not wrap the whole book on their first
     /// frame — but still several screens of prose, so the walk has something to
@@ -2331,6 +2350,67 @@ mod tests {
     /// Bars are quads, and cost the same to draw at any magnification.
     fn draw_bars(view: &Entity<CoolScroll>, cx: &mut VisualTestContext) {
         cx.update(|_window, app| view.update(app, |this, cx| this.set_mode(Mode::Skeleton, cx)));
+    }
+
+    /// A stack resolves in order, and a script none of its families has got falls
+    /// back to a face of its own.
+    ///
+    /// The first half is what makes a stack worth naming: the families are tried in
+    /// the order written and the first that can shape the text is the one it is set
+    /// in, so naming the desktop's own chain gets the desktop's own font. The second
+    /// is what makes naming one safe: a character the stack cannot draw is shaped
+    /// from whatever can, and that run has to carry the face it was shaped with —
+    /// its glyph ids mean nothing to any other face.
+    #[test]
+    fn a_script_the_stack_has_not_got_falls_back_to_its_own_face() {
+        let text_system = ParleyTextSystem::new();
+        text_system
+            .add_fonts(loose_fonts())
+            .expect("the fonts under assets/fonts should load");
+
+        let layout = |text: &str| {
+            let run = gpui::FontRun {
+                font_id: text_system.resolve_font(&Font {
+                    family: document_family(),
+                    ..Default::default()
+                }),
+                len: text.len(),
+            };
+            text_system.layout_line(text, px(14.0), &[run], None)
+        };
+        // The stack has an answer for Latin: it ends in a generic, so it resolves,
+        // and Latin comes from the one face it resolves to.
+        let latin = layout("The quick brown fox");
+        assert!(latin.width.0 > 0.0, "the default stack should shape");
+        let mut latin_faces: Vec<usize> = latin.runs.iter().map(|run| run.font_id.0).collect();
+        latin_faces.dedup();
+        assert_eq!(
+            latin_faces.len(),
+            1,
+            "Latin should come from one face of the stack, not {latin_faces:?}"
+        );
+
+        // Japanese, which no Latin face in the stack has got. A machine that can
+        // draw it at all draws it from some other face; one that cannot leaves the
+        // run on the stack's own face, and then there is nothing here to check.
+        let japanese = layout("日本語");
+        let mut japanese_faces: Vec<usize> =
+            japanese.runs.iter().map(|run| run.font_id.0).collect();
+        japanese_faces.dedup();
+        if japanese_faces == latin_faces {
+            eprintln!("no font here draws 日本語; the stack's own face stands in for it");
+            return;
+        }
+
+        // And a line mixing the two draws from both faces, each run keeping the
+        // face it was shaped with rather than the family that was asked for.
+        let mixed = layout("The quick brown fox 日本語");
+        let mut faces: Vec<usize> = mixed.runs.iter().map(|run| run.font_id.0).collect();
+        faces.dedup();
+        assert!(
+            faces.len() >= 2 && japanese_faces.iter().all(|face| faces.contains(face)),
+            "a mixed line should be shaped from both faces, not {faces:?}"
+        );
     }
 
     /// A family that was never loaded draws the compiled-in one rather than nothing.

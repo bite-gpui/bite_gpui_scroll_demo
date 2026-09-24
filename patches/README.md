@@ -20,8 +20,9 @@ them alone. See `corgi-patches/` for the same pattern.
 `gpui_parley/` is the odd one out. It is not published, so there is nothing to
 patch: it is copied here to be *changed*. It is the crate that shapes the
 document's text, the app installs it with
-`application().with_text_system(...)`, and it reads its embedded fonts from this
-workspace's `assets/fonts/`. It is a plain path dependency and a member of the
+`application().with_text_system(...)`, and it reads fonts from the shaper's own
+database — the host's, through fontique's platform backend, plus everything under
+this workspace's `assets/fonts/`. It is a plain path dependency and a member of the
 workspace, so its own tests and its example stay runnable:
 
     cargo test -p gpui_parley                          # shaping, rasterization, its caches
@@ -32,10 +33,12 @@ workspace, so its own tests and its example stay runnable:
     cargo run --release -p gpui_parley --example frame_cost
 
 The copy's own changes are listed in its manifest. The one worth knowing here is
-that it loads the rest of `assets/fonts/` at runtime through `add_fonts`, and
-shapes and rasterizes in the family it is asked for, out of the shaper's own font
-database rather than a table of its own. That is what the app's `COOL_SCROLL_FONT`
-names — see the app's README.
+that it loads the host's fonts, and the rest of `assets/fonts/` at runtime through
+`add_fonts`, and shapes and rasterizes in the family — or the comma-separated
+*stack* of families — it is asked for, out of the shaper's own font database rather
+than a table of its own. A stack resolves through fontique, in the order written,
+and a glyph none of its families can draw is shaped and cut from whatever face can.
+That is what the app's `COOL_SCROLL_FONT` names — see the app's README.
 
 `raster_cost` is the one to reach for when the document is slow: it times a
 screenful of lines the way the app's transform asks for them — a different font
