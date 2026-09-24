@@ -94,7 +94,7 @@ the bottleneck: switching modes changes nothing about the motion.
 ## Layout
 
     src/           the app
-    assets/        the corpus, the font the text system shapes with, and the demo clip
+    assets/        the corpus, the fonts the text system can be set in, and the demo clip
     patches/       local copies of crates the fork cannot be used for as-is
     bite-gpui/     the GPUI fork this builds against
 
@@ -121,11 +121,19 @@ thing is ~90,000 lines, and the cost is linear in the text). Point
 The measuring and the rendering both go through Parley — Skrifa for the glyph
 outlines, tiny-skia for their coverage — because `main` installs a copy of the
 fork's `gpui_parley` with `application().with_text_system(...)`. Worth knowing
-what that crate is: it shapes with its own embedded IBM Plex Sans and ignores the
-family it is asked for, with hard-coded metrics, so the panel and the document
-are both set in Plex Sans and nothing falls back. It exists to prove GPUI's text
-SPI can be implemented out of tree, not to be a general text stack — which is
-why it lives in `patches/` as a copy, rather than being depended on where it is.
+what that crate is: it compiles in IBM Plex Sans and takes any other font the app
+hands it, shaping and rasterizing from the shaper's own font database, so a font is
+tried by dropping it under `assets/fonts/` and naming it:
+
+    COOL_SCROLL_FONT="Liberation Serif" cargo run --release
+
+A face's family, weight and slant are read out of the font itself, so nothing has
+to be told what a file is, and a name nothing was loaded for falls back to the
+compiled-in family rather than drawing nothing. That is enough to see what these
+effects read like in a serif, or a mono, or whatever is to hand. It exists to prove
+GPUI's text SPI can be implemented out of tree, not to be a general text stack —
+which is why it lives in `patches/` as a copy, rather than being depended on where
+it is.
 
 The **vector** mode is the other route through the same crate: Parley lays the
 line out, then `ParleyTextSystem::glyph_triangles` tessellates a glyph's outline

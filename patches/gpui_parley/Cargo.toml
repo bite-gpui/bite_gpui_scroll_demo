@@ -1,14 +1,19 @@
 # A local copy of this fork's `gpui_parley`, moved out of the checkout so it can
 # be modified here without the checkout losing its pristine-ness.
 #
-# `src/` is the fork's, with two changes. `ParleyPlatformTextSystem` caches the
+# `src/` is the fork's, with three changes. `ParleyPlatformTextSystem` caches the
 # hinting instance it builds for a face at a device size, instead of building one
 # for every glyph it rasterizes: this app asks for a different size on every line
 # of every frame, so the un-cached version built thousands a frame where thirty
 # would do, and that was a third of the cost of rasterizing a text frame here
 # (`cargo run --release -p gpui_parley --example raster_cost` measures it, and
-# prints where the rest of the cost goes). The other is one clippy nit in the
-# crate's own tests, which this workspace lints more strictly than the fork's does.
+# prints where the rest of the cost goes). The second is that `add_fonts` loads a
+# face into the shaper's own font database and `build_layout` shapes in the family
+# it is asked for, so the app can try a font by dropping it under `assets/fonts/`
+# and naming it — and so that the face rasterized is the one that was shaped, since
+# both are chosen by that one database, out of the family, weight and slant read
+# from the font. The third is one clippy nit in the crate's own tests, which this
+# workspace lints more strictly than the fork's does.
 #
 # The fonts it embeds are read from this
 # workspace's `assets/fonts/`, which is exactly where the path in the source

@@ -31,6 +31,12 @@ workspace, so its own tests and its example stay runnable:
     cargo run --release -p gpui_parley --example raster_cost
     cargo run --release -p gpui_parley --example frame_cost
 
+The copy's own changes are listed in its manifest. The one worth knowing here is
+that it loads the rest of `assets/fonts/` at runtime through `add_fonts`, and
+shapes and rasterizes in the family it is asked for, out of the shaper's own font
+database rather than a table of its own. That is what the app's `COOL_SCROLL_FONT`
+names — see the app's README.
+
 `raster_cost` is the one to reach for when the document is slow: it times a
 screenful of lines the way the app's transform asks for them — a different font
 size on every line, so nothing in either cache can be reused between frames —

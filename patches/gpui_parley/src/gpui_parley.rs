@@ -114,21 +114,6 @@ fn map_style(style: gpui_engine::FontStyle) -> FontStyle {
     }
 }
 
-/// Returns the embedded font bytes and index for a GPUI font.
-fn font_data_for(font: &Font) -> (&'static [u8], usize) {
-    let semi_bold = font.weight.0 >= 550.0;
-    let italic = matches!(
-        font.style,
-        gpui_engine::FontStyle::Italic | gpui_engine::FontStyle::Oblique
-    );
-    match (semi_bold, italic) {
-        (false, false) => (FONT_DATA, 0),
-        (false, true) => (FONT_DATA_ITALIC, 0),
-        (true, false) => (FONT_DATA_SEMIBOLD, 0),
-        (true, true) => (FONT_DATA_SEMIBOLD_ITALIC, 0),
-    }
-}
-
 /// Returns the `font_id` of the run that covers `byte`, if any.
 fn font_id_for_byte(runs: &[FontRun], byte: usize) -> Option<FontId> {
     let mut offset = 0;
@@ -559,11 +544,11 @@ impl TextSystem for ParleyTextSystem {
     }
 
     fn all_font_names(&self) -> Vec<String> {
-        vec![FONT_FAMILY.to_string()]
+        self.platform.all_font_names()
     }
 
-    fn add_fonts(&self, _fonts: Vec<std::borrow::Cow<'static, [u8]>>) -> Result<()> {
-        Ok(())
+    fn add_fonts(&self, fonts: Vec<std::borrow::Cow<'static, [u8]>>) -> Result<()> {
+        self.platform.add_fonts(fonts)
     }
 
     fn get_font_for_id(&self, id: FontId) -> Option<Font> {
@@ -912,7 +897,7 @@ impl ParleyPlatformTextSystem {
         }
 
         let (data, index) = self.font_data_for_id(font_id).context("unknown font")?;
-        let font_ref = FontRef::from_index(data, index as u32).context("invalid font data")?;
+        let font_ref = FontRef::from_index(data.data(), index).context("invalid font data")?;
         let units_per_em = font_ref
             .head()
             .context("the font should have a head table")?
@@ -975,8 +960,32 @@ impl ParleyPlatformTextSystem {
         self.font_registry.lock().unwrap().font_for_id(id)
     }
 
-    fn font_data_for_id(&self, id: FontId) -> Option<(&'static [u8], usize)> {
-        self.font_for_id(id).map(|font| font_data_for(&font))
+    /// The face to draw `font` with: its bytes, and where the face sits in them.
+    ///
+    /// This asks the shaper's own database — the family by the name it was asked
+    /// for, then that family's own matcher for the nearest face to the weight and
+    /// slant that were asked for — so what is rasterized is the face that was
+    /// shaped with, and none of it needs to know what faces a font ships. A family
+    /// that was never loaded answers with the compiled-in one, which is why asking
+    /// for a font that is not here draws something rather than nothing.
+    fn font_data_for(&self, font: &Font) -> Option<(parley::fontique::Blob<u8>, u32)> {
+        let mut context = self.font_context.lock().unwrap();
+        let collection = &mut context.collection;
+        let family = collection
+            .family_by_name(&font.family)
+            .or_else(|| collection.family_by_name(FONT_FAMILY))?;
+        let face = family.match_font(
+            parley::fontique::FontWidth::default(),
+            map_style(font.style),
+            map_weight(font.weight),
+            false,
+        )?;
+        Some((face.load(None)?, face.index()))
+    }
+
+    fn font_data_for_id(&self, id: FontId) -> Option<(parley::fontique::Blob<u8>, u32)> {
+        self.font_for_id(id)
+            .and_then(|font| self.font_data_for(&font))
     }
 
     /// The hinting instance for a face at a device size, built once and reused.
@@ -1020,11 +1029,10 @@ impl ParleyPlatformTextSystem {
         &self,
         params: &RenderGlyphParams,
     ) -> Result<(Bounds<DevicePixels>, Vec<u8>)> {
-        let (static_data, index) = self
+        let (data, index) = self
             .font_data_for_id(params.font_id)
             .context("unknown font")?;
-        let data: &[u8] = static_data;
-        let font_ref = FontRef::from_index(data, index as u32).context("invalid font data")?;
+        let font_ref = FontRef::from_index(data.data(), index).context("invalid font data")?;
 
         let device_size = params.font_size.0 * params.scale_factor;
         let outlines = font_ref.outline_glyphs();
@@ -1081,14 +1089,38 @@ impl ParleyPlatformTextSystem {
         let mut font_context = self.font_context.lock().unwrap();
         let mut layout_context = self.layout_context.lock().unwrap();
 
+        // Which runs name a family the shaper has. One it has not is left to the
+        // default above rather than pushed, so asking for a font that is not loaded
+        // draws the compiled-in one instead of nothing at all — and this has to be
+        // asked before the builder is made, because the builder takes the font
+        // context for the rest of the function.
+        let families: Vec<Option<String>> = runs
+            .iter()
+            .map(|run| {
+                self.font_for_id(run.font_id)
+                    .map(|font| font.family.to_string())
+                    .filter(|family| font_context.collection.family_by_name(family).is_some())
+            })
+            .collect();
+
         let mut builder = layout_context.ranged_builder(&mut font_context, text, 1.0, true);
         builder.push_default(StyleProperty::FontFamily(FontFamily::from(FONT_FAMILY)));
         builder.push_default(StyleProperty::FontSize(font_size.0));
 
         let mut byte = 0;
-        for run in runs {
+        for (run, family) in runs.iter().zip(&families) {
             let end = byte + run.len;
             if let Some(font) = self.font_for_id(run.font_id) {
+                // The run's own family, which is what makes a family loaded at
+                // runtime the one the text is shaped in.
+                if let Some(family) = family {
+                    builder.push(
+                        StyleProperty::FontFamily(FontFamily::from(parley::FontFamilyName::Named(
+                            std::borrow::Cow::Owned(family.clone()),
+                        ))),
+                        byte..end,
+                    );
+                }
                 builder.push(
                     StyleProperty::FontWeight(map_weight(font.weight)),
                     byte..end,
@@ -1131,12 +1163,31 @@ impl ParleyPlatformTextSystem {
 }
 
 impl PlatformTextSystem for ParleyPlatformTextSystem {
-    fn add_fonts(&self, _fonts: Vec<std::borrow::Cow<'static, [u8]>>) -> Result<()> {
+    /// Adds faces to the collection the shaper reads.
+    ///
+    /// It is the same collection [`Self::font_data_for`] asks when a glyph is
+    /// rasterized, so a font loaded here is shaped and cut from its own bytes, and
+    /// nothing has to be told what it is: family, weight and slant all come out of
+    /// the font.
+    fn add_fonts(&self, fonts: Vec<std::borrow::Cow<'static, [u8]>>) -> Result<()> {
+        let mut context = self.font_context.lock().unwrap();
+        for data in fonts {
+            context.collection.register_fonts(
+                parley::fontique::Blob::new(Arc::new(data.into_owned())),
+                None,
+            );
+        }
         Ok(())
     }
 
     fn all_font_names(&self) -> Vec<String> {
-        vec![FONT_FAMILY.to_string()]
+        self.font_context
+            .lock()
+            .unwrap()
+            .collection
+            .family_names()
+            .map(str::to_string)
+            .collect()
     }
 
     fn font_id(&self, descriptor: &Font) -> Result<FontId> {
@@ -1178,7 +1229,7 @@ impl PlatformTextSystem for ParleyPlatformTextSystem {
 
     fn advance(&self, font_id: FontId, glyph_id: GlyphId) -> Result<Size<f32>> {
         let (data, index) = self.font_data_for_id(font_id).context("unknown font")?;
-        let font_ref = FontRef::from_index(data, index as u32).context("invalid font data")?;
+        let font_ref = FontRef::from_index(data.data(), index).context("invalid font data")?;
         let units_per_em = font_ref.head().map(|head| head.units_per_em())?;
         let glyph_metrics =
             font_ref.glyph_metrics(SkrifaSize::new(units_per_em as f32), LocationRef::default());
@@ -1191,7 +1242,7 @@ impl PlatformTextSystem for ParleyPlatformTextSystem {
 
     fn glyph_for_char(&self, font_id: FontId, ch: char) -> Option<GlyphId> {
         let (data, index) = self.font_data_for_id(font_id)?;
-        let font_ref = FontRef::from_index(data, index as u32).ok()?;
+        let font_ref = FontRef::from_index(data.data(), index).ok()?;
         let glyph_id = font_ref.charmap().map(ch)?;
         (glyph_id.to_u32() != 0).then_some(GlyphId(glyph_id.to_u32()))
     }

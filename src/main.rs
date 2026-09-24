@@ -27,9 +27,12 @@
 mod document;
 mod motion;
 
+use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use gpui::prelude::*;
@@ -37,13 +40,14 @@ use gpui::{
     AnyElement, App, Bounds, Context, CursorStyle, Div, Font, FontWeight, FramePipelineExt as _,
     Hsla, MouseButton, MouseDownEvent, MouseMoveEvent, Path, PathVertex, Pixels, Point, Render,
     ScrollDelta, ScrollWheelEvent, ShapedLine, SharedString, Size, StandardImmediatePipeline,
-    Stateful, TextRun, TitlebarOptions, Window, WindowBounds, WindowOptions, WindowTextSystem,
-    application, canvas, div, fill, point, px, relative, rgba, size,
+    Stateful, TextRun, TextStyle, TextSystem as _, TitlebarOptions, Window, WindowBounds,
+    WindowOptions, WindowTextSystem, application, canvas, div, fill, point, px, relative, rgba,
+    size,
 };
 use gpui_animotion::{
     AnimotionExt as _, Interpolate as _, SpringParams, VelocityTracker, prop, spring, tween,
 };
-use gpui_parley::{ParleyTextSystem, ParleyTextSystemExt as _};
+use gpui_parley::{FONT_FAMILY, ParleyTextSystem, ParleyTextSystemExt as _};
 
 use document::{BASE_SPACING, CONTENT_WIDTH, Line, Style};
 use motion::{Effect, FRAMES_PER_SECOND, IntensitySpec, Motion, Settings, intensity_spec};
@@ -443,7 +447,7 @@ impl CoolScroll {
         let text_system = window.text_system().clone();
         let base = window.text_style();
         let mut measure = |word: &str, style: Style| -> f32 {
-            let mut font = base.font();
+            let mut font = document_font(&base);
             if style == Style::Heading {
                 font.weight = FontWeight::BOLD;
             }
@@ -563,7 +567,7 @@ impl Render for CoolScroll {
                 settings: &settings,
                 mode,
                 text_system: window.text_system(),
-                font: window.text_style().font(),
+                font: document_font(&window.text_style()),
                 shaped: &self.shaped,
                 triangles: &triangles,
                 scale_factor: window.scale_factor(),
@@ -1581,7 +1585,76 @@ fn frame_cap_interval() -> Option<Duration> {
     FRAME_CAP.map(|cap| Duration::from_secs_f32(1.0 / cap as f32))
 }
 
+/// The environment variable that names the family the document is set in.
+///
+/// The text system compiles one family in and takes others at runtime, so naming a
+/// family whose face is under `assets/fonts/` is all it takes to try a font —
+/// nothing is rebuilt, and nothing has to be told what the face is: its family,
+/// weight and slant are read out of the font itself.
+const FONT_VAR: &str = "COOL_SCROLL_FONT";
+
+/// The family the document is set in.
+fn document_family() -> SharedString {
+    static FAMILY: OnceLock<SharedString> = OnceLock::new();
+    FAMILY
+        .get_or_init(|| match std::env::var(FONT_VAR) {
+            Ok(family) if !family.trim().is_empty() => SharedString::from(family),
+            _ => SharedString::from(FONT_FAMILY),
+        })
+        .clone()
+}
+
+/// The font the document is set in: the window's own text style, in the family the
+/// app was started with.
+///
+/// This is the only place the family is decided, because the two things that have to
+/// agree about it are the measuring that wraps the document and the shaping that
+/// draws it — given different families, the lines would be wrapped to one font's
+/// widths and drawn in another's.
+fn document_font(base: &TextStyle) -> Font {
+    let mut font = base.font();
+    font.family = document_family();
+    font
+}
+
+/// The faces under `assets/fonts/`, for the text system to shape and cut with.
+///
+/// Everything the text system compiles in is already loaded, so this is the extra:
+/// dropping a font in is all it takes to be able to name it. A file that cannot be
+/// read is reported and skipped rather than failing the start-up.
+fn loose_fonts() -> Vec<Cow<'static, [u8]>> {
+    let mut fonts = Vec::new();
+    let mut directories = vec![PathBuf::from("assets/fonts")];
+    while let Some(directory) = directories.pop() {
+        let Ok(entries) = std::fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                directories.push(path);
+            } else if matches!(
+                path.extension().and_then(|extension| extension.to_str()),
+                Some("ttf" | "otf")
+            ) {
+                match std::fs::read(&path) {
+                    Ok(data) => fonts.push(Cow::Owned(data)),
+                    Err(error) => eprintln!("{}: {error}", path.display()),
+                }
+            }
+        }
+    }
+    fonts
+}
+
 fn main() {
+    // The extra faces go in before the window exists: the document is measured
+    // through the text system on its first frame.
+    let text_system = ParleyTextSystem::new();
+    text_system
+        .add_fonts(loose_fonts())
+        .expect("the fonts under assets/fonts should load");
+
     application()
         // Frames arrive at the display's rate by default. `ThrottledPipeline`
         // defers the ones that come sooner than the cap allows, leaving them
@@ -1594,9 +1667,9 @@ fn main() {
         })
         // Shape and lay out the document through Parley rather than the default
         // engine: `gpui_parley` implements the same `TextSystem` SPI on top of
-        // Parley, Skrifa and tiny-skia, and shapes with its own embedded IBM
-        // Plex Sans. See `patches/gpui_parley`.
-        .with_text_system(ParleyTextSystem::new())
+        // Parley, Skrifa and tiny-skia, with IBM Plex Sans compiled in and the rest
+        // of `assets/fonts/` handed to it above. See `patches/gpui_parley`.
+        .with_text_system(text_system)
         .run(|cx: &mut App| {
             let bounds = Bounds::centered(None, size(px(1280.0), px(800.0)), cx);
             cx.open_window(
@@ -2169,7 +2242,7 @@ mod tests {
                 settings: &view.settings,
                 mode: Mode::Vector,
                 text_system: window.text_system(),
-                font: window.text_style().font(),
+                font: document_font(&window.text_style()),
                 shaped: &view.shaped,
                 triangles: &triangles,
                 scale_factor: window.scale_factor(),
@@ -2258,6 +2331,53 @@ mod tests {
     /// Bars are quads, and cost the same to draw at any magnification.
     fn draw_bars(view: &Entity<CoolScroll>, cx: &mut VisualTestContext) {
         cx.update(|_window, app| view.update(app, |this, cx| this.set_mode(Mode::Skeleton, cx)));
+    }
+
+    /// A family that was never loaded draws the compiled-in one rather than nothing.
+    ///
+    /// Loading a font is additive: `add_fonts` puts it in the one collection the
+    /// shaper and the rasterizer both read, so this is the guard on that — a name
+    /// nobody loaded, which is what the readout asks for with its `monospace`, has
+    /// to fall back instead of shaping to an empty line.
+    #[test]
+    fn an_unknown_family_falls_back_to_the_loaded_one() {
+        let text_system = ParleyTextSystem::new();
+        text_system
+            .add_fonts(loose_fonts())
+            .expect("the fonts under assets/fonts should load");
+
+        let width = |family: &str| {
+            let font = Font {
+                family: SharedString::from(family),
+                ..Default::default()
+            };
+            let run = gpui::FontRun {
+                font_id: text_system.resolve_font(&font),
+                len: 19,
+            };
+            f32::from(
+                text_system
+                    .layout_line("The quick brown fox", px(14.0), &[run], None)
+                    .width,
+            )
+        };
+
+        assert!(
+            text_system
+                .all_font_names()
+                .iter()
+                .any(|name| name == FONT_FAMILY),
+            "the compiled-in family should always be loaded"
+        );
+        assert!(
+            width(FONT_FAMILY) > 0.0,
+            "the compiled-in family should shape"
+        );
+        assert_eq!(
+            width("No Such Family"),
+            width(FONT_FAMILY),
+            "an unknown family should draw the compiled-in one"
+        );
     }
 
     /// Where a frame goes, in this build and on this machine.
@@ -2397,7 +2517,7 @@ mod tests {
                     settings: &view.settings,
                     mode,
                     text_system: window.text_system(),
-                    font: window.text_style().font(),
+                    font: document_font(&window.text_style()),
                     shaped: &view.shaped,
                     triangles: &triangles,
                     scale_factor: window.scale_factor(),
