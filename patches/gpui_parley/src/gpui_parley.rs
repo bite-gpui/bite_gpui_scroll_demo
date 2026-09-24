@@ -24,6 +24,8 @@ use gpui_engine::{
 pub use gpui_engine::{PlatformTextSystem, TextSystem};
 use gpui_shared_string::SharedString;
 use gpui_types::{Bounds, DevicePixels, Hsla, Pixels, Point, Size, px};
+use lyon::path::FillRule as LyonFillRule;
+use lyon::tessellation::{BuffersBuilder, FillOptions, FillTessellator, FillVertex, VertexBuffers};
 use parley::{
     Alignment, AlignmentOptions, FontContext, FontFamily, FontStyle, FontWeight, IndentOptions,
     LayoutContext, PositionedLayoutItem, StyleProperty, YieldData,
@@ -51,6 +53,30 @@ const FONT_DATA_SEMIBOLD_ITALIC: &[u8] =
     include_bytes!("../../../assets/fonts/ibm-plex-sans/IBMPlexSans-SemiBoldItalic.ttf");
 /// The family name shared by the embedded fonts.
 pub const FONT_FAMILY: &str = "IBM Plex Sans";
+
+/// How many hinting instances to keep around.
+///
+/// The transform asks for a different size on every line of every frame, so this
+/// is a cap on growth rather than a working set: the instances are cheap to
+/// rebuild (thirty a frame, not one a glyph).
+const HINTING_CACHE_LIMIT: usize = 64;
+
+/// How many tessellated glyph outlines to keep.
+///
+/// The cache key includes the size the outline was flattened for, because the
+/// flattening tolerance is a fraction of a *device* pixel: a glyph flattened for
+/// 14px has visible facets under an 8x magnifier. Keying on a quantized size
+/// keeps the key coarse — a handful of bands, not one entry per size the
+/// transform asks for.
+const GLYPH_PATH_CACHE_LIMIT: usize = 4096;
+
+/// A glyph outline, flattened and tessellated into triangles.
+///
+/// Coordinates are in **em units** — a capital is about 0.7 of one — so a caller
+/// draws them at any size by multiplying: no tessellation is tied to a size, and
+/// one cached outline serves every line of every frame this app will draw. This
+/// is what `Window::paint_path` takes, once transformed.
+pub type GlyphTriangles = Vec<[Point<Pixels>; 3]>;
 
 /// Builds a [`parley::FontContext`] pre-loaded with the embedded fonts.
 ///
@@ -216,6 +242,52 @@ impl OutlinePen for GlyphPathBuilder {
 
     fn curve_to(&mut self, cx0: f32, cy0: f32, cx1: f32, cy1: f32, x: f32, y: f32) {
         self.builder.cubic_to(cx0, -cy0, cx1, -cy1, x, -y);
+    }
+
+    fn close(&mut self) {
+        self.builder.close();
+    }
+}
+
+/// A pen that builds a [`lyon`] path, for tessellating an outline.
+struct LyonPathBuilder {
+    builder: lyon::path::path::Builder,
+}
+
+impl LyonPathBuilder {
+    fn new() -> Self {
+        Self {
+            builder: lyon::path::Path::builder(),
+        }
+    }
+
+    fn build(self) -> lyon::path::Path {
+        self.builder.build()
+    }
+}
+
+/// Glyph outlines arrive y-up and are drawn y-down, as in [`GlyphPathBuilder`].
+impl OutlinePen for LyonPathBuilder {
+    fn move_to(&mut self, x: f32, y: f32) {
+        // `begin` is this builder's `move_to`.
+        self.builder.begin(lyon::math::point(x, -y));
+    }
+
+    fn line_to(&mut self, x: f32, y: f32) {
+        self.builder.line_to(lyon::math::point(x, -y));
+    }
+
+    fn quad_to(&mut self, cx0: f32, cy0: f32, x: f32, y: f32) {
+        self.builder
+            .quadratic_bezier_to(lyon::math::point(cx0, -cy0), lyon::math::point(x, -y));
+    }
+
+    fn curve_to(&mut self, cx0: f32, cy0: f32, cx1: f32, cy1: f32, x: f32, y: f32) {
+        self.builder.cubic_bezier_to(
+            lyon::math::point(cx0, -cy0),
+            lyon::math::point(cx1, -cy1),
+            lyon::math::point(x, -y),
+        );
     }
 
     fn close(&mut self) {
@@ -420,6 +492,31 @@ impl ParleyTextSystem {
         }
         layout.align(Alignment::Start, AlignmentOptions::default());
         layout
+    }
+
+    /// A glyph's outline, flattened and tessellated into triangles.
+    ///
+    /// The point of this is a glyph drawn as *vectors*: tessellate once for the
+    /// size a glyph is roughly drawn at, then scale the triangles to whatever
+    /// size each line of a frame asks for, instead of rasterizing a mask per
+    /// glyph per size. Coordinates come back in **em units**, so drawing at a
+    /// size is one multiply — see [`GlyphTriangles`].
+    ///
+    /// `device_size` is the size the glyph is actually drawn at (the line's
+    /// scale included) and `max_error` the flattening error tolerated there, in
+    /// device pixels — a quarter of one, say. Both are part of the cache key, so
+    /// a caller that wants hits should quantize `device_size` into bands rather
+    /// than passing the transform's size straight through; rounding up to the
+    /// next power of two means the flattening is always fine enough to draw.
+    pub fn glyph_triangles(
+        &self,
+        font_id: FontId,
+        glyph_id: GlyphId,
+        device_size: f32,
+        max_error: f32,
+    ) -> Result<Arc<GlyphTriangles>> {
+        self.platform
+            .glyph_triangles(font_id, glyph_id, device_size, max_error)
     }
 }
 
@@ -743,6 +840,19 @@ struct ParleyPlatformTextSystem {
     font_context: Mutex<FontContext>,
     layout_context: Mutex<LayoutContext>,
     font_registry: Mutex<FontRegistry>,
+    /// Hinting instances, keyed by face and device size.
+    hinting: Mutex<HashMap<(usize, u32), Arc<HintingInstance>>>,
+    /// Tessellated glyph outlines, keyed by face, glyph, and the size they were
+    /// flattened for.
+    glyph_paths: Mutex<HashMap<(usize, u32, u32), Arc<GlyphTriangles>>>,
+}
+
+/// A [`lyon`] point as this crate's geometry, in em units.
+fn pixels(point: lyon::math::Point, units_per_em: f32) -> Point<Pixels> {
+    Point {
+        x: px(point.x / units_per_em),
+        y: px(point.y / units_per_em),
+    }
 }
 
 /// Maps GPUI [`Font`]s to stable [`FontId`]s and back.
@@ -776,7 +886,85 @@ impl ParleyPlatformTextSystem {
             font_context: Mutex::new(font_context()),
             layout_context: Mutex::new(LayoutContext::new()),
             font_registry: Mutex::new(FontRegistry::default()),
+            hinting: Mutex::new(HashMap::new()),
+            glyph_paths: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// A glyph's outline as triangles, flattened finely enough for the size it
+    /// will be drawn at.
+    ///
+    /// The caller passes the *device* size (the size the glyph is actually drawn
+    /// at, line scale included) and the error it will tolerate in device pixels;
+    /// the outline comes back in font units, so it can be scaled to that size —
+    /// or any other — at paint time. Ask for the same size twice and the second
+    /// answer is the first.
+    fn glyph_triangles(
+        &self,
+        font_id: FontId,
+        glyph_id: GlyphId,
+        device_size: f32,
+        max_error: f32,
+    ) -> Result<Arc<GlyphTriangles>> {
+        let key = (font_id.0, glyph_id.0, device_size.to_bits());
+        if let Some(triangles) = self.glyph_paths.lock().unwrap().get(&key) {
+            return Ok(triangles.clone());
+        }
+
+        let (data, index) = self.font_data_for_id(font_id).context("unknown font")?;
+        let font_ref = FontRef::from_index(data, index as u32).context("invalid font data")?;
+        let units_per_em = font_ref
+            .head()
+            .context("the font should have a head table")?
+            .units_per_em() as f32;
+        let outlines = font_ref.outline_glyphs();
+        let glyph = outlines
+            .get(SkrifaGlyphId::new(glyph_id.0))
+            .context("missing glyph outline")?;
+
+        let mut pen = LyonPathBuilder::new();
+        glyph
+            .draw(
+                DrawSettings::unhinted(SkrifaSize::new(units_per_em), LocationRef::default()),
+                &mut pen,
+            )
+            .context("unable to draw glyph outline")?;
+        let path = pen.build();
+
+        // The path is in font units and the caller's budget is in device pixels,
+        // so the tolerance converts through the size the glyph is drawn at.
+        let tolerance = (max_error * units_per_em / device_size.max(0.001)).max(0.01);
+        let mut buffers: VertexBuffers<lyon::math::Point, u32> = VertexBuffers::new();
+        FillTessellator::new()
+            .tessellate_path(
+                &path,
+                // Nonzero, because a glyph's counters are holes and this pipeline
+                // has no stencil to resolve them with: the triangles it is handed
+                // have to be wound correctly before they get there.
+                &FillOptions::tolerance(tolerance).with_fill_rule(LyonFillRule::NonZero),
+                &mut BuffersBuilder::new(&mut buffers, |vertex: FillVertex| vertex.position()),
+            )
+            .context("unable to tessellate glyph outline")?;
+
+        let (triangles, _) = buffers.indices.as_chunks::<3>();
+        let triangles: GlyphTriangles = triangles
+            .iter()
+            .map(|[a, b, c]| {
+                [
+                    pixels(buffers.vertices[*a as usize], units_per_em),
+                    pixels(buffers.vertices[*b as usize], units_per_em),
+                    pixels(buffers.vertices[*c as usize], units_per_em),
+                ]
+            })
+            .collect();
+        let triangles = Arc::new(triangles);
+
+        let mut cache = self.glyph_paths.lock().unwrap();
+        if cache.len() >= GLYPH_PATH_CACHE_LIMIT {
+            cache.clear();
+        }
+        cache.insert(key, triangles.clone());
+        Ok(triangles)
     }
 
     fn resolve_font(&self, font: &Font) -> FontId {
@@ -791,6 +979,43 @@ impl ParleyPlatformTextSystem {
         self.font_for_id(id).map(|font| font_data_for(&font))
     }
 
+    /// The hinting instance for a face at a device size, built once and reused.
+    ///
+    /// `skrifa` builds one by running the font's hinting program at a size, which
+    /// came to a third of the cost of rasterizing the glyph it was then used on —
+    /// and because this app asks for a different size on every line of every
+    /// frame, an un-cached version builds thousands of them a frame.
+    fn hinting_instance(
+        &self,
+        params: &RenderGlyphParams,
+        device_size: f32,
+        outlines: &skrifa::outline::OutlineGlyphCollection<'_>,
+    ) -> Result<Arc<HintingInstance>> {
+        let key = (params.font_id.0, device_size.to_bits());
+        let mut cache = self.hinting.lock().unwrap();
+        if let Some(instance) = cache.get(&key) {
+            return Ok(instance.clone());
+        }
+
+        let instance = Arc::new(
+            HintingInstance::new(
+                outlines,
+                SkrifaSize::new(device_size),
+                LocationRef::default(),
+                HintingOptions::default(),
+            )
+            .context("unable to create hinting instance")?,
+        );
+
+        // Every frame brings sizes that have never been asked for before, so
+        // this has to be bounded.
+        if cache.len() >= HINTING_CACHE_LIMIT {
+            cache.clear();
+        }
+        cache.insert(key, instance.clone());
+        Ok(instance)
+    }
+
     fn rasterize_outline(
         &self,
         params: &RenderGlyphParams,
@@ -801,15 +1026,9 @@ impl ParleyPlatformTextSystem {
         let data: &[u8] = static_data;
         let font_ref = FontRef::from_index(data, index as u32).context("invalid font data")?;
 
-        let size = SkrifaSize::new(params.font_size.0 * params.scale_factor);
+        let device_size = params.font_size.0 * params.scale_factor;
         let outlines = font_ref.outline_glyphs();
-        let hinting = HintingInstance::new(
-            &outlines,
-            size,
-            LocationRef::default(),
-            HintingOptions::default(),
-        )
-        .context("unable to create hinting instance")?;
+        let hinting = self.hinting_instance(params, device_size, &outlines)?;
         let glyph_id = SkrifaGlyphId::new(params.glyph_id.0);
         let glyph = outlines.get(glyph_id).context("missing glyph outline")?;
 
@@ -1105,7 +1324,7 @@ mod tests {
 
         assert_eq!(wrapped.wrap_width, Some(px(100.0)));
         assert!(
-            wrapped.wrap_boundaries.len() >= 1,
+            !wrapped.wrap_boundaries.is_empty(),
             "expected at least one wrap boundary"
         );
         assert!(wrapped.width() <= px(100.0));

@@ -1,14 +1,23 @@
 # A local copy of this fork's `gpui_parley`, moved out of the checkout so it can
 # be modified here without the checkout losing its pristine-ness.
 #
-# `src/` is the fork's, unedited. The fonts it embeds are read from this
+# `src/` is the fork's, with two changes. `ParleyPlatformTextSystem` caches the
+# hinting instance it builds for a face at a device size, instead of building one
+# for every glyph it rasterizes: this app asks for a different size on every line
+# of every frame, so the un-cached version built thousands a frame where thirty
+# would do, and that was a third of the cost of rasterizing a text frame here
+# (`cargo run --release -p gpui_parley --example raster_cost` measures it, and
+# prints where the rest of the cost goes). The other is one clippy nit in the
+# crate's own tests, which this workspace lints more strictly than the fork's does.
+#
+# The fonts it embeds are read from this
 # workspace's `assets/fonts/`, which is exactly where the path in the source
 # already points (`../../../assets/fonts/...` resolves the same way from
-# `patches/gpui_parley/src/` as from `crates/gpui_parley/src/`), so nothing in
-# the library had to change. Only this manifest — which inherits
+# `patches/gpui_parley/src/` as from `crates/gpui_parley/src/`), so nothing else
+# in the library had to change. Its manifest inherits
 # `edition.workspace = true`, `[lints] workspace = true` and every dependency
-# from the fork's workspace — is rewritten, with the versions the fork's
-# workspace resolves at `d418335`.
+# from the fork's workspace, so that is rewritten here, with the versions the
+# fork's workspace resolves at `d418335`.
 #
 # Unlike `patches/gpui_unofficial` and `patches/gpui_animotion`, this is not a
 # `[patch.crates-io]` target: the crate is not published, so it is depended on by
@@ -47,6 +56,9 @@ gpui = { path = "../../bite-gpui/crates/gpui", default-features = false, optiona
 gpui_engine = { path = "../../bite-gpui/crates/gpui_engine" }
 gpui_shared_string = { path = "../../bite-gpui/crates/gpui_shared_string" }
 gpui_types = { path = "../../bite-gpui/crates/gpui_types" }
+# For tessellating glyph outlines into triangles; the fork already compiles
+# lyon 1.0 for `gpui_types`, so this adds nothing to the build.
+lyon = "1.0"
 parley = "0.11"
 skrifa = "0.44"
 smallvec = { version = "1.6", features = ["union", "const_new"] }

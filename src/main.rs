@@ -11,9 +11,9 @@
 //! Scroll with the wheel or trackpad, or drag the document directly for a
 //! flick. The panel in the top-right arms each effect and sets its intensity;
 //! the readout in the bottom-left shows what the simulation is doing. The
-//! panel's first switch is not one of the five: it draws the document as
-//! skeleton bars rather than setting its text — the same lines either way, with
-//! nothing to re-shape as the transform resizes them.
+//! panel's first control is not one of the five: it chooses how the document
+//! itself is painted — set as text, drawn as skeleton bars, or drawn as the
+//! glyphs' own outlines, tessellated once and scaled by the transform.
 //!
 //! The document's motion is one of `gpui_animotion`'s interruptible
 //! properties: a wheel tick tweens it to where the wheel has asked for, a drag
@@ -27,20 +27,23 @@
 mod document;
 mod motion;
 
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use gpui::prelude::*;
 use gpui::{
-    AnyElement, App, Bounds, Context, CursorStyle, Div, FontWeight, Hsla, MouseButton,
-    MouseDownEvent, MouseMoveEvent, Pixels, Render, ScrollDelta, ScrollWheelEvent, SharedString,
-    Size, Stateful, TextRun, TitlebarOptions, Window, WindowBounds, WindowOptions, application,
-    canvas, div, fill, point, px, relative, rgba, size,
+    AnyElement, App, Bounds, Context, CursorStyle, Div, Font, FontWeight, FramePipelineExt as _,
+    Hsla, MouseButton, MouseDownEvent, MouseMoveEvent, Path, PathVertex, Pixels, Point, Render,
+    ScrollDelta, ScrollWheelEvent, ShapedLine, SharedString, Size, StandardImmediatePipeline,
+    Stateful, TextRun, TitlebarOptions, Window, WindowBounds, WindowOptions, WindowTextSystem,
+    application, canvas, div, fill, point, px, relative, rgba, size,
 };
 use gpui_animotion::{
     AnimotionExt as _, Interpolate as _, SpringParams, VelocityTracker, prop, spring, tween,
 };
-use gpui_parley::ParleyTextSystem;
+use gpui_parley::{ParleyTextSystem, ParleyTextSystemExt as _};
 
 use document::{BASE_SPACING, CONTENT_WIDTH, Line, Style};
 use motion::{Effect, FRAMES_PER_SECOND, IntensitySpec, Motion, Settings, intensity_spec};
@@ -84,6 +87,22 @@ const SKELETON_BAR: f32 = 0.7;
 /// How round a skeleton bar's ends are, in unscaled document pixels.
 const SKELETON_RADIUS: f32 = 3.0;
 
+/// How much error a glyph's outline may be flattened with, in device pixels.
+///
+/// The tolerances are relative to the size the glyph is drawn at, so a quarter
+/// of a pixel is finer than anything the transform can magnify into view.
+const GLYPH_ERROR: f32 = 0.25;
+
+/// The size an outline should be tessellated for, given the size it is drawn at.
+///
+/// Rounding *up* to a power of two means the flattening is always fine enough at
+/// the size drawn — and it makes the tessellation cache's key coarse, which is
+/// the point of rounding at all: a handful of bands rather than one outline per
+/// size the transform asks for.
+fn band(size: f32) -> f32 {
+    2f32.powf(size.max(0.001).log2().ceil())
+}
+
 /// A one-shot property animation, mounted only while it has somewhere to go.
 ///
 /// `gpui_animotion`'s declarative element samples its tracks from the first
@@ -102,11 +121,11 @@ struct Transition {
     settles_at: Instant,
 }
 
-/// How many switches the panel has: one for each effect, and one for the
-/// document itself.
-const SWITCHES: usize = Effect::ALL.len() + 1;
-/// The document switch's slot, after the effects'.
-const DOCUMENT_SWITCH: usize = Effect::ALL.len();
+/// How many switches the panel has: one for each effect.
+///
+/// The document's own control is not a switch but a selector, which keeps its
+/// own row of transitions in [`Switches::mode`].
+const SWITCHES: usize = Effect::ALL.len();
 
 /// The panel's switches, and the animations of whichever ones are moving.
 ///
@@ -120,6 +139,8 @@ struct Switches {
     knob: [Option<Transition>; SWITCHES],
     dim: [Option<Transition>; SWITCHES],
     track: [Option<Transition>; SWITCHES],
+    /// Per mode: the selector's cell, as it lights up or gives way to another.
+    mode: [Option<Transition>; Mode::ALL.len()],
 }
 
 impl Switches {
@@ -145,13 +166,34 @@ impl Switches {
         });
     }
 
+    /// Move the selector's selection from `from` to `to`.
+    ///
+    /// Every cell whose state actually changed gets a transition — the one that
+    /// loses the selection as well as the one that takes it, so the two cross
+    /// over on the same clock rather than one jumping out from under the other.
+    fn select(&mut self, from: Mode, to: Mode, now: Instant) {
+        for mode in Mode::ALL {
+            let (was, is) = (mode == from, mode == to);
+            if was == is {
+                continue;
+            }
+            self.mode[mode.index()] = Some(Transition {
+                from: armed(was),
+                to: armed(is),
+                settles_at: now + Duration::from_secs_f32(CONTROL_SECS),
+            });
+        }
+    }
+
     /// Forget the transitions that have settled, so their elements unmount.
     fn drop_settled(&mut self, now: Instant) {
-        for transitions in [&mut self.knob, &mut self.dim, &mut self.track] {
-            for transition in transitions {
-                if transition.is_some_and(|transition| transition.settles_at <= now) {
-                    *transition = None;
-                }
+        let settled =
+            |transition: &Option<Transition>| transition.is_some_and(|t| t.settles_at <= now);
+        let switches: [&mut [Option<Transition>]; 3] =
+            [&mut self.knob, &mut self.dim, &mut self.track];
+        for transition in switches.into_iter().flatten().chain(self.mode.iter_mut()) {
+            if settled(transition) {
+                *transition = None;
             }
         }
     }
@@ -222,41 +264,95 @@ fn switch_color(armed: f32) -> Hsla {
 }
 
 /// How the document is drawn.
+///
+/// The three modes are the same lines: what changes is what a line costs to
+/// paint, and what the transform has to redo when it changes its size.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum Mode {
     /// The corpus, set in the window's text style.
+    ///
+    /// Each line is shaped and rasterized at the size the transform asks for on
+    /// the frame it is drawn, which is the reference the other two are measured
+    /// against: the sharpest text, and the only mode that does that work twice
+    /// over whenever a line changes size.
     #[default]
     Text,
     /// The same lines, with their glyphs replaced by bars.
     ///
     /// The layout is identical — a bar is as wide as the word it stands in for,
     /// and sits on the same line — so the two can be compared directly. What it
-    /// saves is text shaping: the transform asks for a different font size on
-    /// every line of every frame, and a bar does not have to be shaped at all.
+    /// saves is everything about text: a bar is a quad, and no amount of
+    /// resizing asks the text system to shape or rasterize anything.
     Skeleton,
+    /// The same lines, drawn as the glyphs' own outlines.
+    ///
+    /// A glyph's outline does not change shape with the size it is drawn at, so
+    /// each one is tessellated into triangles once and scaled, per line, to
+    /// whatever size the transform is asking for. Nothing is rasterized per
+    /// frame: placing a glyph is one multiply per corner of its triangles.
+    Vector,
 }
 
 impl Mode {
-    const fn is_skeleton(self) -> bool {
-        matches!(self, Mode::Skeleton)
+    /// The modes, in the order the selector shows them.
+    const ALL: [Mode; 3] = [Mode::Text, Mode::Skeleton, Mode::Vector];
+
+    /// This mode's slot in the selector.
+    const fn index(self) -> usize {
+        match self {
+            Mode::Text => 0,
+            Mode::Skeleton => 1,
+            Mode::Vector => 2,
+        }
     }
 
-    const fn toggled(self) -> Self {
+    /// The name on the selector's cell, and on the readout's first line.
+    const fn label(self) -> &'static str {
         match self {
-            Mode::Text => Mode::Skeleton,
-            Mode::Skeleton => Mode::Text,
+            Mode::Text => "Text",
+            Mode::Skeleton => "Skeleton",
+            Mode::Vector => "Vector",
+        }
+    }
+
+    /// What the mode's cell is found by, for tests.
+    ///
+    /// `debug_bounds` takes a `&'static str`, so this cannot be built from
+    /// [`Mode::label`] at the call site.
+    const fn key(self) -> &'static str {
+        match self {
+            Mode::Text => "mode-text",
+            Mode::Skeleton => "mode-skeleton",
+            Mode::Vector => "mode-vector",
+        }
+    }
+
+    /// What the mode is for, under the selector.
+    const fn description(self) -> &'static str {
+        match self {
+            Mode::Text => {
+                "Set every line at the size the transform asks for. The reference the other two \
+                 are measured against: sharp at any magnification, and shaped and rasterized \
+                 afresh whenever a line changes size."
+            }
+            Mode::Skeleton => SKELETON_DESCRIPTION,
+            Mode::Vector => {
+                "The same glyphs as their own outlines, tessellated once and scaled to whatever \
+                 size each line asks for. Nothing is rasterized per frame — placing a glyph is a \
+                 multiply per corner — so the same work covers any magnification."
+            }
         }
     }
 }
 
-/// The document mode switch's label, and what it is for.
-const SKELETON_TITLE: &str = "Skeleton text";
+/// The document mode selector's heading, and what the skeleton mode is for.
+const DOCUMENT_TITLE: &str = "Document";
 const SKELETON_DESCRIPTION: &str = "Draw every line as bars instead of setting its text. Same layout, same motion — but a bar never has \
      to be re-shaped at the size the transform asks for, and that is where a slow frame goes.";
 
 struct CoolScroll {
     settings: Settings,
-    /// Whether the corpus is set as text or drawn as skeleton bars.
+    /// How the corpus is drawn: set as text, as bars, or as glyph outlines.
     mode: Mode,
     motion: Motion,
     /// The corpus as it came off disk. It is wrapped into `document` on the first
@@ -264,9 +360,27 @@ struct CoolScroll {
     source: String,
     /// The wrapped document: what the engine walks, and what gets painted.
     document: Rc<Vec<Line>>,
+    /// The vector mode's lines, shaped, by document index.
+    ///
+    /// The text mode asks the text system to shape every visible line on every
+    /// frame, at whatever size the transform is asking for on that frame. The
+    /// vector mode wants none of that: a glyph's place in its line and the
+    /// width of the line are proportional to the size it is set at, and the
+    /// outline itself does not change with size at all — so one shaping at the
+    /// document's own size serves every size the line is ever drawn at. It is
+    /// filled in as lines come on screen rather than up front, because shaping
+    /// the whole book is a second of work for a screenful of reading.
+    shaped: RefCell<HashMap<usize, ShapedLine>>,
     /// When the last frame was drawn. Only elapsed time matters here, so a
     /// plain monotonic clock is enough.
     last_frame: Instant,
+    /// How long the last frame's interval was, and how much of it went on
+    /// building the document's elements. The two are worth telling apart: the
+    /// interval is what the frame *cost*, wherever the work happened, while the
+    /// walk is the part this file does — visibly cheap in a mode whose frame is
+    /// spent elsewhere, which is what makes the readout worth reading.
+    frame_time: Duration,
+    walk_time: Duration,
     /// Set while the document itself is being dragged.
     scroll_drag: Option<ScrollDrag>,
     /// Set while a slider is being dragged.
@@ -310,7 +424,10 @@ impl CoolScroll {
             motion: Motion::new(),
             source,
             document: Rc::new(Vec::new()),
+            shaped: RefCell::new(HashMap::new()),
             last_frame: Instant::now(),
+            frame_time: Duration::ZERO,
+            walk_time: Duration::ZERO,
             scroll_drag: None,
             slider_drag: None,
             switches: Switches::default(),
@@ -356,9 +473,10 @@ impl CoolScroll {
     /// Elapsed time since the last frame, in 60fps frames.
     fn elapsed_frames(&mut self) -> f32 {
         let now = Instant::now();
-        let elapsed = now.duration_since(self.last_frame).as_secs_f32();
+        let elapsed = now.duration_since(self.last_frame);
         self.last_frame = now;
-        (elapsed * FRAMES_PER_SECOND).clamp(MIN_FRAMES, MAX_FRAMES)
+        self.frame_time = elapsed;
+        (elapsed.as_secs_f32() * FRAMES_PER_SECOND).clamp(MIN_FRAMES, MAX_FRAMES)
     }
 
     /// Let go of the document, handing whatever speed the pointer had to a
@@ -393,21 +511,16 @@ impl CoolScroll {
         cx.notify();
     }
 
-    /// Set the document's drawing mode, springing the switch that changes it.
+    /// Set the document's drawing mode, moving the selector's selection.
     ///
-    /// The two modes are the same document, so this is only a change of how the
-    /// lines are drawn: the scroll offset, the length of the document and
+    /// The modes are the same document, so this is only a change of how the
+    /// lines are painted: the scroll offset, the length of the document and
     /// everything the transform is doing about it all stay as they are.
     fn set_mode(&mut self, mode: Mode, cx: &mut Context<Self>) {
         if mode == self.mode {
             return;
         }
-        self.switches.transition(
-            DOCUMENT_SWITCH,
-            self.mode.is_skeleton(),
-            mode.is_skeleton(),
-            Instant::now(),
-        );
+        self.switches.select(self.mode, mode, Instant::now());
         self.mode = mode;
         cx.notify();
     }
@@ -439,15 +552,25 @@ impl Render for CoolScroll {
         let switches = self.switches;
         let mode = self.mode;
         let dragging = self.scroll_drag.is_some();
+        // What the vector mode placed this frame, for the readout. The walk is
+        // what fills it in, so it is read after the walk returns.
+        let triangles = Cell::new(0);
+        let walk = Instant::now();
         let lines = visible_lines(
             Scene {
                 document: &self.document,
                 motion: &self.motion,
                 settings: &settings,
                 mode,
+                text_system: window.text_system(),
+                font: window.text_style().font(),
+                shaped: &self.shaped,
+                triangles: &triangles,
+                scale_factor: window.scale_factor(),
             },
             window.viewport_size(),
         );
+        self.walk_time = walk.elapsed();
 
         div()
             .relative()
@@ -459,7 +582,14 @@ impl Render for CoolScroll {
             .text_color(rgba(0xededff))
             .child(document_field(lines, dragging, cx))
             .child(panel(&settings, mode, &switches, cx))
-            .child(readout(&self.motion))
+            .child(readout(
+                &self.motion,
+                mode,
+                triangles.get(),
+                self.frame_time,
+                self.walk_time,
+                frame_cap_interval(),
+            ))
     }
 }
 
@@ -595,8 +725,7 @@ fn panel(
         .children(Effect::ALL.map(|effect| effect_group(settings, switches, cx, effect)))
 }
 
-/// The document's own switch: whether the corpus is set as text, or drawn as
-/// skeleton bars.
+/// The document's own control: how the corpus is drawn.
 fn document_group(mode: Mode, switches: &Switches, cx: &mut Context<CoolScroll>) -> Div {
     div()
         .flex()
@@ -604,37 +733,91 @@ fn document_group(mode: Mode, switches: &Switches, cx: &mut Context<CoolScroll>)
         .gap_2()
         .child(
             div()
-                .flex()
-                .items_center()
-                .justify_between()
-                .child(
-                    div()
-                        // 14px/500, per the prototype's `.toggle-row`.
-                        .text_size(px(14.0))
-                        .font_weight(FontWeight::MEDIUM)
-                        .child(SKELETON_TITLE),
-                )
-                .child(switch(
-                    "skeleton",
-                    DOCUMENT_SWITCH,
-                    mode.is_skeleton(),
-                    switches,
-                    cx,
-                    |this, cx| {
-                        let mode = this.mode.toggled();
-                        this.set_mode(mode, cx);
-                    },
-                )),
+                // 14px/500, like the effects' own titles.
+                .text_size(px(14.0))
+                .font_weight(FontWeight::MEDIUM)
+                .child(DOCUMENT_TITLE),
         )
+        .child(mode_selector(mode, switches, cx))
         .child(
             div()
                 // 11px/1.4, per the prototype's `.description`.
                 .text_size(px(11.0))
                 .line_height(relative(1.4))
                 .text_color(rgba(0x888888ff))
-                .child(SKELETON_DESCRIPTION),
+                .child(mode.description()),
         )
         .child(div().h(px(1.0)).w_full().bg(rgba(0xffffff1a)))
+}
+
+/// How the document is drawn, as one choice among three.
+///
+/// A switch would leave the modes as two independent things that happen to be
+/// exclusive; the document is drawn exactly one of these ways, so the control
+/// says so and there is no state in which two of them are on. The selected cell
+/// lights up on the same clock the switches change on.
+fn mode_selector(mode: Mode, switches: &Switches, cx: &mut Context<CoolScroll>) -> Div {
+    div()
+        .flex()
+        .gap_1()
+        .p(px(2.0))
+        .rounded_md()
+        .bg(rgba(0x00000033))
+        .children(Mode::ALL.map(|candidate| {
+            let slot = candidate.index();
+            let selected = candidate == mode;
+
+            // The animated face is a plain `Div` inside the interactive cell:
+            // `gpui_animotion`'s extension trait is implemented for `Div`, while
+            // what carries the click is a `Stateful<Div>`.
+            let face = div()
+                .flex()
+                .items_center()
+                .justify_center()
+                .w_full()
+                .py(px(4.0))
+                .rounded_sm()
+                .text_size(px(12.0))
+                .font_weight(FontWeight::MEDIUM)
+                .child(candidate.label());
+
+            let face = match switches.mode[slot] {
+                Some(Transition { from, to, .. }) => face
+                    .animotion(
+                        ("mode", slot),
+                        vec![
+                            prop(tween(from, to, CONTROL_SECS), |el, selection| {
+                                el.bg(accent(0.22 * selection))
+                            }),
+                            prop(tween(from, to, CONTROL_SECS), |el, selection| {
+                                el.text_color(mode_text(selection))
+                            }),
+                        ],
+                    )
+                    .into_any_element(),
+                None => face
+                    .bg(accent(0.22 * armed(selected)))
+                    .text_color(mode_text(armed(selected)))
+                    .into_any_element(),
+            };
+
+            div()
+                .id(("mode", slot))
+                .debug_selector(move || candidate.key().to_owned())
+                .flex_1()
+                .cursor_pointer()
+                .on_click(
+                    cx.listener(move |this, _event, _window, cx| this.set_mode(candidate, cx)),
+                )
+                .child(face)
+                .into_any_element()
+        }))
+}
+
+/// How solid a selector cell's label is drawn: grey when another mode holds the
+/// selection, white when this one does.
+fn mode_text(selection: f32) -> Hsla {
+    grey(1.0, 0.55 + 0.45 * selection)
 }
 
 /// One effect: its switch, what it is going for, and its intensity.
@@ -899,8 +1082,16 @@ fn intensity_control(
 }
 
 /// The readout, in the bottom-left corner.
-fn readout(motion: &Motion) -> Div {
+fn readout(
+    motion: &Motion,
+    mode: Mode,
+    triangles: usize,
+    frame_time: Duration,
+    walk_time: Duration,
+    cap: Option<Duration>,
+) -> Div {
     let scrolling = motion.is_scrolling();
+    let millis = |time: Duration| time.as_secs_f32() * 1000.0;
 
     div()
         .absolute()
@@ -913,6 +1104,35 @@ fn readout(motion: &Motion) -> Div {
         .line_height(relative(1.5))
         .font_family("monospace")
         .text_color(grey(1.0, 0.5))
+        .child(match mode {
+            // The triangle count is the vector mode's whole per-frame CPU work
+            // made visible: it is the same number at any magnification.
+            Mode::Vector => format!("Mode: {} ({} triangles)", mode.label(), triangles),
+            mode => format!("Mode: {}", mode.label()),
+        })
+        // The interval is the last frame as a whole — whatever asked for it, and
+        // however far it fell short of the display's rate. The walk is the part
+        // of it this file does: the elements' own building, which for the vector
+        // mode is where its triangles are placed. A frame whose interval is much
+        // larger than its walk is one the GPU (or the glyphs' rasterization) is
+        // paying for.
+        //
+        // The cap is in there when there is one, because an interval only means
+        // something next to it: a frame sitting on the cap is the cap working,
+        // and one above it is the app not keeping up.
+        .child(match cap {
+            Some(cap) => format!(
+                "Frame: {:.1} ms (cap {:.1}, walk {:.1})",
+                millis(frame_time),
+                millis(cap),
+                millis(walk_time),
+            ),
+            None => format!(
+                "Frame: {:.1} ms (walk {:.1})",
+                millis(frame_time),
+                millis(walk_time),
+            ),
+        })
         .child(format!("Velocity: {:.1} px/f", motion.velocity))
         .child(
             div()
@@ -933,20 +1153,33 @@ fn readout(motion: &Motion) -> Div {
 
 /// Everything the walk through the document needs: the lines themselves, what
 /// the transform is doing to them, and how they are to be drawn.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct Scene<'a> {
     document: &'a [Line],
     motion: &'a Motion,
     settings: &'a Settings,
     mode: Mode,
+    /// The window's text system, which shapes the vector mode's lines and
+    /// tessellates its glyphs.
+    text_system: &'a WindowTextSystem,
+    /// The window's font: the vector mode's runs are shaped in it, so that a
+    /// line's glyphs are the ones the text mode would set.
+    font: Font,
+    /// The vector mode's shaped lines, by document index.
+    shaped: &'a RefCell<HashMap<usize, ShapedLine>>,
+    /// Triangles the vector mode placed this frame, for the readout.
+    triangles: &'a Cell<usize>,
+    /// How many device pixels the window draws a logical one with, which is what
+    /// decides how finely a glyph's outline has to be flattened.
+    scale_factor: f32,
 }
 
 /// The lines on screen, laid out from the anchor outwards.
 ///
 /// The prototype did this walk inside its render loop and drew bars into a
 /// canvas; here the same walk hands back a div per line, and gpui shapes and
-/// paints each one — as text, or, in [`Mode::Skeleton`], as the bars that stand
-/// in for its words.
+/// paints each one — as text, as the bars that stand in for its words, or as
+/// the triangles of its glyphs' own outlines.
 fn visible_lines(scene: Scene, viewport: Size<Pixels>) -> Vec<AnyElement> {
     let (document, motion, settings) = (scene.document, scene.motion, scene.settings);
     let height = f32::from(viewport.height);
@@ -968,7 +1201,7 @@ fn visible_lines(scene: Scene, viewport: Size<Pixels>) -> Vec<AnyElement> {
     for index in anchor_index..document.len() as isize {
         let rel_y = index as f32 * BASE_SPACING - scroll;
         let scale = motion.scale_at(rel_y, settings);
-        if let Some(line) = line_element(scene, center_x, index as usize, screen_y, scale) {
+        if let Some(line) = line_element(scene.clone(), center_x, index as usize, screen_y, scale) {
             lines.push(line);
         }
         screen_y += BASE_SPACING * scale;
@@ -982,7 +1215,7 @@ fn visible_lines(scene: Scene, viewport: Size<Pixels>) -> Vec<AnyElement> {
         let rel_y = index as f32 * BASE_SPACING - scroll;
         let scale = motion.scale_at(rel_y, settings);
         screen_y -= BASE_SPACING * scale;
-        if let Some(line) = line_element(scene, center_x, index as usize, screen_y, scale) {
+        if let Some(line) = line_element(scene.clone(), center_x, index as usize, screen_y, scale) {
             lines.push(line);
         }
         if screen_y < -OVERDRAW {
@@ -997,7 +1230,7 @@ fn visible_lines(scene: Scene, viewport: Size<Pixels>) -> Vec<AnyElement> {
 /// for how fast it is moving.
 ///
 /// Returns `None` for a line that has faded out entirely, so it is never laid
-/// out or shaped at all.
+/// out, shaped or tessellated at all.
 fn line_element(
     scene: Scene,
     center_x: f32,
@@ -1008,7 +1241,7 @@ fn line_element(
     let line = scene.document.get(index)?;
     let height = line.height() * scale;
     let start_x = (center_x - CONTENT_WIDTH / 2.0).max(40.0) + line.indent;
-    let (luminance, opacity) = line_fade(line, scene, scale);
+    let (luminance, opacity) = line_fade(line, &scene, scale);
     if opacity <= 0.01 {
         return None;
     }
@@ -1022,7 +1255,12 @@ fn line_element(
     Some(match scene.mode {
         Mode::Text => element
             // The text is set at the size the transform asks for, rather than
-            // scaled as a bitmap, so it stays sharp at any magnification.
+            // scaled as a bitmap, so it stays sharp at any magnification. The size
+            // is exact: the layout, and so every glyph's position and the line's
+            // width, is what the transform asked for. It is the *rasterizer* that
+            // rounds the size it keys a glyph on, which is what keeps the atlas
+            // answering instead of cutting a new mask for every glyph of every line
+            // of every frame. See `Window::GLYPH_RASTER_STEP` in the fork.
             .text_size(px(line.style.font_size() * scale))
             .line_height(relative(line.style.height() / line.style.font_size()))
             .when(line.style == Style::Heading, |el| {
@@ -1035,7 +1273,171 @@ fn line_element(
             .h(px(height))
             .children(skeleton(line, height, scale, color))
             .into_any_element(),
+        Mode::Vector => {
+            // The path is built here, where the text system is in reach, and
+            // handed to the canvas to push at paint time: `paint_path` is only
+            // callable while the frame is being painted.
+            let path = vector_path(
+                &scene,
+                line,
+                index,
+                start_x,
+                screen_y - (height / 2.0),
+                scale,
+            );
+            canvas(
+                |_, _, _| (),
+                move |_, _, window, _cx| window.paint_path(path, color),
+            )
+            .absolute()
+            .left(px(start_x))
+            .top(px(screen_y - (height / 2.0)))
+            .w(px(CONTENT_WIDTH * scale))
+            .h(px(height))
+            .into_any_element()
+        }
     })
+}
+
+/// One line of the document as a single path of triangles, in window
+/// coordinates.
+///
+/// A glyph's outline does not change shape with the size it is drawn at, so
+/// every glyph here is a cached tessellation in em units and placing one is a
+/// multiply per corner of its triangles. Nothing in here rasterizes anything,
+/// which is the whole difference from [`Mode::Text`]: the same triangles are
+/// placed again at whatever size each frame asks for, instead of a new mask
+/// being cut for every glyph at every size.
+fn vector_path(
+    scene: &Scene,
+    line: &Line,
+    index: usize,
+    left: f32,
+    top: f32,
+    scale: f32,
+) -> Path<Pixels> {
+    let mut path = Path::new(point(px(left), px(top)));
+    // The app installs the Parley text system itself, so this is the text system
+    // it is on; without it there are no outlines to ask for and the line is
+    // simply not drawn.
+    let Some(parley) = scene.text_system.as_parley() else {
+        return path;
+    };
+
+    // The line's own copy, shaped the first frame it is on screen. The cache is
+    // taken out of the scene first, so that holding it open does not stand in the
+    // way of naming the rest of the scene below.
+    let cache = scene.shaped;
+    let mut shapes = cache.borrow_mut();
+    let shaped = shapes.entry(index).or_insert_with(|| shape(scene, line));
+
+    // The size the glyphs are drawn at, which is the size their outlines — in em
+    // units — are multiplied by.
+    let glyph_size = line.style.font_size() * scale;
+    // Flattened for the size the glyph is drawn at, in device pixels, and for a
+    // device pixel's worth of error there — so the facets of a magnified glyph
+    // are finer than the transform can show, and one outline in each band serves
+    // every line that lands in it.
+    let band = band(glyph_size * scene.scale_factor);
+
+    // Where the line's baseline sits: the same sum the text system's own painter
+    // does — the box the document gives a line of this style, with the shaper's
+    // ascent and descent centred in it.
+    let height = line.height() * scale;
+    let (ascent, descent) = (
+        f32::from(shaped.ascent) * scale,
+        f32::from(shaped.descent) * scale,
+    );
+    let baseline = top + (height - ascent - descent) / 2.0 + ascent;
+
+    // The path's own bounds, gathered as the triangles are placed: the renderer
+    // clips the path against them and the shader discards what is outside.
+    let (mut min_x, mut min_y) = (f32::INFINITY, f32::INFINITY);
+    let (mut max_x, mut max_y) = (f32::NEG_INFINITY, f32::NEG_INFINITY);
+
+    for run in &shaped.runs {
+        for glyph in &run.glyphs {
+            // A glyph the font has no outline for is one the text mode would have
+            // drawn as a missing-glyph box; there is nothing to tessellate, so it
+            // is left out rather than failing the line.
+            let Ok(triangles) = parley.glyph_triangles(run.font_id, glyph.id, band, GLYPH_ERROR)
+            else {
+                continue;
+            };
+
+            // Where the shaper put the glyph, at the size this line is drawn at.
+            let x = left + f32::from(glyph.position.x) * scale;
+            let y = baseline + f32::from(glyph.position.y) * scale;
+
+            // The corners are pushed straight onto the path rather than through
+            // `Path::push_triangle`, which unions a `Bounds` for every corner it
+            // is handed — three struct-wide updates per triangle, measured at
+            // half again the cost of building the whole path. What those unions
+            // were for is kept here, in plain floats.
+            path.vertices.reserve(triangles.len() * 3);
+            for triangle in triangles.iter() {
+                for corner in triangle {
+                    let (corner_x, corner_y) =
+                        (x + corner.x.0 * glyph_size, y + corner.y.0 * glyph_size);
+                    min_x = min_x.min(corner_x);
+                    min_y = min_y.min(corner_y);
+                    max_x = max_x.max(corner_x);
+                    max_y = max_y.max(corner_y);
+                    path.vertices.push(PathVertex {
+                        xy_position: point(px(corner_x), px(corner_y)),
+                        // All three corners in the solid part of the shader's
+                        // implicit curve, which is what a tessellated glyph is:
+                        // the outline's curvature is already in the triangle, so
+                        // there is nothing left for the fragment stage to
+                        // evaluate.
+                        st_position: SOLID,
+                    });
+                }
+            }
+            scene.triangles.set(scene.triangles.get() + triangles.len());
+        }
+    }
+
+    if !path.vertices.is_empty() {
+        path.bounds = Bounds::new(
+            point(px(min_x), px(min_y)),
+            size(px(max_x - min_x), px(max_y - min_y)),
+        );
+    }
+    path
+}
+
+/// Where a triangle's corners sit in the rasterizer's own parameterisation, to
+/// be filled as solid triangles rather than evaluated as curve segments.
+const SOLID: Point<f32> = point(0.0, 1.0);
+
+/// The vector mode's copy of a line: shaped once, at the document's own size.
+///
+/// Shaping is what [`Mode::Text`] does afresh for every visible line of every
+/// frame, at whatever size the transform is asking for. The vector mode needs it
+/// once per line, because a glyph's place in its line and the width of the line
+/// are proportional to the size the line is set at, and the outline itself does
+/// not change with size at all — so one shaping answers for every size the line
+/// is ever drawn at.
+///
+/// A line is shaped in the window's font, emboldened if the document calls it a
+/// heading, which is what the text mode's own run does.
+fn shape(scene: &Scene, line: &Line) -> ShapedLine {
+    let mut font = scene.font.clone();
+    if line.style == Style::Heading {
+        font.weight = FontWeight::BOLD;
+    }
+    // The run's colour is the text mode's; the vector mode paints the outlines
+    // itself, from the fade `line_fade` works out at paint time.
+    let run = TextRun {
+        len: line.text.len(),
+        font,
+        color: rgba(0xffffffff).into(),
+        ..Default::default()
+    };
+    scene
+        .text_system
+        .shape_line(line.text.clone(), px(line.style.font_size()), &[run], None)
 }
 
 /// The bars a skeleton line is drawn from.
@@ -1065,7 +1467,7 @@ fn skeleton(line: &Line, height: f32, scale: f32, color: Hsla) -> Vec<AnyElement
 }
 
 /// How a line is drawn at this instant: how bright it is, and how solid.
-fn line_fade(line: &Line, scene: Scene, scale: f32) -> (f32, f32) {
+fn line_fade(line: &Line, scene: &Scene, scale: f32) -> (f32, f32) {
     let motion = scene.motion;
     let settings = scene.settings;
 
@@ -1157,8 +1559,39 @@ fn load_corpus() -> String {
     }
 }
 
+/// The most frames a second the document is drawn at while it is moving, or
+/// `None` for the display's own rate.
+///
+/// The motion is time-based rather than frame-based, so this changes nothing
+/// about what a scroll looks like — only how many frames it is made of, and
+/// therefore what it costs to watch one. A frame that is allowed to be 33ms late
+/// instead of 16 has twice the room to arrive in, and the frames that arrive late
+/// are the ones that read as stutter.
+///
+/// It is a *cap*, not a target: a build or a machine that cannot make 30 frames a
+/// second still draws every frame it can, and the readout's `Frame:` line says
+/// which of the two the app is actually doing. Off by default — a cap buys
+/// steadiness at a lower rate, and if the frames themselves are what is expensive
+/// it buys nothing at all.
+const FRAME_CAP: Option<u32> = None;
+
+/// The interval `FRAME_CAP` allows between frames, for reporting the frame rate
+/// against something.
+fn frame_cap_interval() -> Option<Duration> {
+    FRAME_CAP.map(|cap| Duration::from_secs_f32(1.0 / cap as f32))
+}
+
 fn main() {
     application()
+        // Frames arrive at the display's rate by default. `ThrottledPipeline`
+        // defers the ones that come sooner than the cap allows, leaving them
+        // pending rather than dropping them, so the document still moves at the
+        // same speed and only the number of frames it is drawn in changes. See
+        // `FRAME_CAP`.
+        .with_frame_pipeline(|_window_id| match FRAME_CAP {
+            Some(cap) => Box::new(StandardImmediatePipeline.max_fps(cap)),
+            None => Box::new(StandardImmediatePipeline),
+        })
         // Shape and lay out the document through Parley rather than the default
         // engine: `gpui_parley` implements the same `TextSystem` SPI on top of
         // Parley, Skrifa and tiny-skia, and shapes with its own embedded IBM
@@ -1194,7 +1627,6 @@ fn main() {
 mod tests {
     use super::*;
     use gpui::{Entity, Modifiers, Point, TestAppContext, TouchPhase, VisualTestContext};
-    use gpui_parley::ParleyTextSystemExt as _;
 
     /// A short corpus, so most tests do not wrap the whole book on their first
     /// frame — but still several screens of prose, so the walk has something to
@@ -1254,19 +1686,36 @@ mod tests {
         );
 
         // The document is text rather than painted bars, so a screenful is
-        // checked on the walk that hands lines to the element tree.
-        // The document is walked as one frame of it would be: a screenful of
-        // lines, in whichever mode.
-        let visible = walk(cx, &view, Mode::Text);
+        // checked on the walk that hands lines to the element tree. The walk is
+        // what a frame does, so all three modes walk the same document.
+        let text = walk(cx, &view, Mode::Text);
         assert!(
-            visible > 20,
-            "expected a screenful of lines, walked {visible}"
+            text.lines > 20,
+            "expected a screenful of lines, walked {}",
+            text.lines
+        );
+        assert_eq!(
+            text.triangles, 0,
+            "the text mode draws glyphs, not the outlines of them"
         );
 
-        // Skeleton mode is the same document drawn differently, so the walk
-        // should find exactly the same lines on screen.
         let skeleton = walk(cx, &view, Mode::Skeleton);
-        assert_eq!(skeleton, visible, "the modes walk the same document");
+        assert_eq!(
+            skeleton.lines, text.lines,
+            "the modes walk the same document"
+        );
+        assert_eq!(
+            skeleton.triangles, 0,
+            "the skeleton mode draws bars, not outlines"
+        );
+
+        let vector = walk(cx, &view, Mode::Vector);
+        assert_eq!(vector.lines, text.lines, "the modes walk the same document");
+        assert!(
+            vector.triangles > 1000,
+            "a screenful of outlines should be thousands of triangles, placed {}",
+            vector.triangles
+        );
 
         // GPUI's wheel deltas run the opposite way to the DOM's: negative y is a
         // scroll down. Both directions are pinned here, because getting the sign
@@ -1482,21 +1931,31 @@ mod tests {
     /// Dragging takes the document with the pointer, and letting go of a drag
     /// that was still moving throws it: a kinetic flick carries the document on
     /// past where the pointer last asked it to be.
+    ///
+    /// Drawn as bars, and in a window small enough that a frame of it is quick,
+    /// because what is being tested here is the pointer — see [`draw_bars`] for
+    /// what a slow frame does to a flick's measurement. For the same reason the
+    /// moves are a hand's short flick rather than a leisurely one: the samples a
+    /// flick is built from are taken against the clock, and a frame drawn between
+    /// two of them must not cost so much that the next lands stale.
     #[gpui::test]
     fn dragging_throws_the_document(cx: &mut TestAppContext) {
         use_parley(cx);
         let (view, cx) = cx.add_window_view(|_window, _cx| view());
-        cx.simulate_resize(size(px(1000.0), px(700.0)));
+        cx.simulate_resize(size(px(400.0), px(300.0)));
         cx.run_until_parked();
+        draw_bars(&view, cx);
 
         let before = offset(cx, &view);
-        let (x, mut y) = (500.0, 500.0);
+        // Clear of the panel, which owns the top-right corner.
+        let (x, mut y) = (40.0, 200.0);
         cx.simulate_mouse_down(point(px(x), px(y)), MouseButton::Left, Modifiers::default());
 
         for _ in 0..6 {
             // Real gaps between the moves: a velocity tracker needs an interval
-            // to measure, and a hand takes one.
-            std::thread::sleep(Duration::from_millis(30));
+            // to measure, and a hand takes one. Short, so that several land
+            // inside the window the tracker keeps whichever the frame costs.
+            std::thread::sleep(Duration::from_millis(10));
             y -= 12.0;
             cx.simulate_mouse_move(point(px(x), px(y)), MouseButton::Left, Modifiers::default());
         }
@@ -1530,6 +1989,7 @@ mod tests {
         let (view, cx) = cx.add_window_view(|_window, _cx| view());
         cx.simulate_resize(size(px(1000.0), px(700.0)));
         cx.run_until_parked();
+        draw_bars(&view, cx);
 
         // Throw the document by hand, and let it get up to speed.
         cx.update(|_window, app| view.update(app, |this, _cx| this.motion.release(3000.0)));
@@ -1569,14 +2029,15 @@ mod tests {
         cx.run_until_parked();
 
         let text = quads(cx);
-        let switch = cx
-            .debug_bounds("switch-skeleton")
-            .expect("the document switch should be rendered");
+        let skeleton = mode_cell(cx, Mode::Skeleton);
 
-        cx.simulate_mouse_move(switch.center(), None, Modifiers::default());
+        cx.simulate_mouse_move(skeleton.center(), None, Modifiers::default());
         cx.run_until_parked();
-        cx.simulate_click(switch.center(), Modifiers::default());
-        assert!(cx.update(|_window, app| view.read(app).mode.is_skeleton()));
+        cx.simulate_click(skeleton.center(), Modifiers::default());
+        assert_eq!(
+            cx.update(|_window, app| view.read(app).mode),
+            Mode::Skeleton
+        );
         pump(cx);
 
         // Text is glyphs rather than quads, so a screenful of bars is a
@@ -1587,8 +2048,9 @@ mod tests {
             "a screenful of bars should be a screenful of quads: {text} -> {skeleton}"
         );
 
-        cx.simulate_click(switch.center(), Modifiers::default());
-        assert!(!cx.update(|_window, app| view.read(app).mode.is_skeleton()));
+        let back = mode_cell(cx, Mode::Text);
+        cx.simulate_click(back.center(), Modifiers::default());
+        assert_eq!(cx.update(|_window, app| view.read(app).mode), Mode::Text);
         pump(cx);
 
         let back = quads(cx);
@@ -1596,30 +2058,357 @@ mod tests {
             back < skeleton - 100,
             "switching back should take the bars away again: {skeleton} -> {back}"
         );
-        // Within a couple of quads: the switch's own knob and fill are painted
-        // from an animation or from their state, which need not be the same
-        // number of quads, but the document's own bars must all be gone.
+        // Within a couple of quads: the selector's own cells are painted from an
+        // animation or from their state, which need not be the same number of
+        // quads, but the document's own bars must all be gone.
         assert!(
             (back as f32 - text as f32).abs() <= 2.0,
             "text mode should draw the document as it did before: {text} -> {back}"
         );
     }
 
-    /// How many lines the view lays out for a 1000x700 viewport in `mode`,
-    /// counted the way a frame counts them.
-    fn walk(cx: &mut VisualTestContext, view: &Entity<CoolScroll>, mode: Mode) -> usize {
-        cx.update(|_window, app| {
+    /// Selecting a mode lights its cell up on the same clock the switches use, and
+    /// the animation is dropped once it has settled, so a settled selector asks
+    /// for no frames.
+    #[gpui::test]
+    fn selecting_a_mode_animates_its_cell(cx: &mut TestAppContext) {
+        use_parley(cx);
+        let (view, cx) = cx.add_window_view(|_window, _cx| view());
+        cx.simulate_resize(size(px(1000.0), px(700.0)));
+        cx.run_until_parked();
+
+        let cell = mode_cell(cx, Mode::Vector);
+        cx.simulate_mouse_move(cell.center(), None, Modifiers::default());
+        cx.run_until_parked();
+        cx.simulate_click(cell.center(), Modifiers::default());
+
+        // The cell giving the selection up and the one taking it both move, or
+        // the selection would jump out from under the one that is leaving.
+        let tweening = cx.update(|_window, app| view.read(app).switches.mode);
+        assert!(
+            tweening[Mode::Text.index()].is_some() && tweening[Mode::Vector.index()].is_some(),
+            "both cells should be tweening"
+        );
+
+        std::thread::sleep(Duration::from_millis(1000));
+        pump(cx);
+        let settled = cx.update(|_window, app| view.read(app).switches.mode);
+        assert!(
+            settled.iter().all(Option::is_none),
+            "a settled selector should be dropped"
+        );
+    }
+
+    /// The vector mode draws the document as the outlines of its glyphs: the
+    /// walk places triangles for every line, and shapes each of them once.
+    #[gpui::test]
+    fn vector_mode_draws_glyph_outlines(cx: &mut TestAppContext) {
+        use_parley(cx);
+        let (view, cx) = cx.add_window_view(|_window, _cx| view());
+        cx.simulate_resize(size(px(1000.0), px(700.0)));
+        cx.run_until_parked();
+
+        let vector = walk(cx, &view, Mode::Vector);
+        assert!(
+            vector.triangles > 1000,
+            "a screenful of outlines should be thousands of triangles, placed {}",
+            vector.triangles
+        );
+
+        // Outlines are neither quads nor glyphs, so the headless window has no
+        // way to show them; the walk's own count is what says they were placed.
+        // What the same walk *does* have to hand over is one shaped line per
+        // line drawn — not one per frame, which is the whole point of the mode.
+        let shaped = cx.update(|_window, app| view.read(app).shaped.borrow().len());
+        assert_eq!(
+            shaped, vector.lines,
+            "the vector mode should shape each line once, not once a frame"
+        );
+
+        walk(cx, &view, Mode::Vector);
+        let again = cx.update(|_window, app| view.read(app).shaped.borrow().len());
+        assert_eq!(again, shaped, "a second frame should shape nothing new");
+
+        // And the same lines, still drawn by the same walk.
+        let cell = mode_cell(cx, Mode::Vector);
+        cx.simulate_mouse_move(cell.center(), None, Modifiers::default());
+        cx.run_until_parked();
+        cx.simulate_click(cell.center(), Modifiers::default());
+        assert_eq!(cx.update(|_window, app| view.read(app).mode), Mode::Vector);
+        pump(cx);
+        assert_eq!(
+            walk(cx, &view, Mode::Vector).lines,
+            vector.lines,
+            "the mode should not have moved the document"
+        );
+    }
+
+    /// A line drawn as vectors is the line the shaper laid out: the path spans
+    /// it, starts where it starts, and its ink is the right size and the right
+    /// way up.
+    ///
+    /// The window cannot show the outlines, but the path that carries them is
+    /// just geometry, so where it landed can be read off its own vertices.
+    #[gpui::test]
+    fn a_vector_line_follows_the_shaped_line(cx: &mut TestAppContext) {
+        use_parley(cx);
+        let (view, cx) = cx.add_window_view(|_window, _cx| view());
+        cx.simulate_resize(size(px(1000.0), px(700.0)));
+        cx.run_until_parked();
+
+        // Where the walk would put the line, and at the size the document asks
+        // for, so the numbers below are the document's own.
+        const LEFT: f32 = 100.0;
+        const TOP: f32 = 0.0;
+        let (line, path, shaped) = cx.update(|window, app| {
             let view = view.read(app);
-            visible_lines(
+            let triangles = Cell::new(0);
+            let scene = Scene {
+                document: &view.document,
+                motion: &view.motion,
+                settings: &view.settings,
+                mode: Mode::Vector,
+                text_system: window.text_system(),
+                font: window.text_style().font(),
+                shaped: &view.shaped,
+                triangles: &triangles,
+                scale_factor: window.scale_factor(),
+            };
+            let index = view
+                .document
+                .iter()
+                .position(|line| line.style == Style::Body)
+                .expect("the corpus should wrap into prose");
+            let line = view.document[index].clone();
+            let path = vector_path(&scene, &line, index, LEFT, TOP, 1.0);
+            // Drawing a line shapes it and keeps the result, so the shaper's own
+            // numbers can be read back off the cache rather than asked for twice.
+            let shaped = view
+                .shaped
+                .borrow()
+                .get(&index)
+                .cloned()
+                .expect("the vector mode should have shaped the line it drew");
+            (line, path, shaped)
+        });
+
+        let (mut ink_left, mut ink_top) = (f32::INFINITY, f32::INFINITY);
+        let (mut ink_right, mut ink_bottom) = (f32::NEG_INFINITY, f32::NEG_INFINITY);
+        for vertex in &path.vertices {
+            let x = f32::from(vertex.xy_position.x);
+            let y = f32::from(vertex.xy_position.y);
+            ink_left = ink_left.min(x);
+            ink_top = ink_top.min(y);
+            ink_right = ink_right.max(x);
+            ink_bottom = ink_bottom.max(y);
+        }
+
+        let size = line.style.font_size();
+        let width = f32::from(shaped.width);
+        // Where the shaper says the baseline is. Its glyphs sit on it already —
+        // `position.y` is measured down from the top of the line's box — and the
+        // text mode's own painter centres the box's leading around it, which is
+        // the sum this repeats. A line drawn as vectors has to land on the same
+        // baseline, or the two modes could not be compared.
+        let baseline = TOP
+            + (line.height() - f32::from(shaped.ascent) - f32::from(shaped.descent)) / 2.0
+            + f32::from(shaped.ascent)
+            + f32::from(shaped.runs[0].glyphs[0].position.y);
+
+        // Outlines come back in em units, so the ink comes to about the size of
+        // the text, standing on the baseline: a cap's height above it, and no
+        // more than a descender below. A missing or doubled size would show up
+        // as a sliver or as something four times the size, and an outline drawn
+        // the wrong way up would hang its ink below the baseline instead.
+        let above = baseline - ink_top;
+        let below = ink_bottom - baseline;
+        assert!(
+            above > 0.6 * size && above < 1.05 * size,
+            "the tallest ink should stand a cap above the baseline, not {above} on {size}px text"
+        );
+        assert!(
+            (-1.0..0.35 * size).contains(&below),
+            "the lowest ink should hang below the baseline by a descender at most, not {below}"
+        );
+
+        // And the line is the shaper's line: starting where the line starts,
+        // give or take the first glyph's left side bearing, and spanning it.
+        assert!(
+            (0.0..20.0).contains(&(ink_left - LEFT)),
+            "the line should start at its own origin: {}",
+            ink_left - LEFT
+        );
+        let ink_width = ink_right - ink_left;
+        assert!(
+            ink_width > width - 10.0 && ink_width <= width,
+            "the line's ink should span the shaper's own line: {ink_width} of {width}"
+        );
+    }
+
+    /// Draw the document as skeleton bars rather than as text.
+    ///
+    /// The tests that drive the pointer want this, and not for speed alone. A
+    /// pointer's speed is measured in wall-clock time — the flick a release
+    /// throws is built from samples taken inside a fifth of a second of it — and
+    /// the harness draws a frame between two events. A debug build spends about
+    /// a second on a screenful of text, and rather more while a flick has the
+    /// transform magnifying lines, so every sample but the last would fall
+    /// outside that window and the flick would be measured as no movement at
+    /// all: the assertions would then hold or fail on how fast the machine is.
+    /// Bars are quads, and cost the same to draw at any magnification.
+    fn draw_bars(view: &Entity<CoolScroll>, cx: &mut VisualTestContext) {
+        cx.update(|_window, app| view.update(app, |this, cx| this.set_mode(Mode::Skeleton, cx)));
+    }
+
+    /// Where a frame goes, in this build and on this machine.
+    ///
+    /// Prints rather than asserts, so it is ignored by default:
+    ///
+    ///     cargo test --features test-support -- --ignored --nocapture a_frame
+    ///
+    /// Each row is a mode drawn at rest and then with a flick in flight, since
+    /// the two are very different pictures: a flick has the transform magnifying
+    /// lines, and in a debug build a magnified glyph is the most expensive thing
+    /// a frame can contain. The interval is the whole frame; the walk is the
+    /// share of it spent in this file, building the document's elements.
+    #[gpui::test]
+    #[ignore = "prints timings instead of asserting"]
+    fn a_frame_is_spent(cx: &mut TestAppContext) {
+        use_parley(cx);
+        let (view, cx) = cx.add_window_view(|_window, _cx| view());
+        cx.simulate_resize(size(px(1000.0), px(700.0)));
+        cx.run_until_parked();
+
+        for mode in Mode::ALL {
+            for action in ["rest", "flick"] {
+                cx.update(|_window, app| {
+                    view.update(app, |this, cx| {
+                        this.set_mode(mode, cx);
+                        if action == "flick" {
+                            this.motion.release(2000.0);
+                        } else {
+                            this.motion.grab();
+                        }
+                    })
+                });
+
+                let mut frames = Vec::new();
+                let mut walks = Vec::new();
+                for _ in 0..8 {
+                    pump(cx);
+                    cx.update(|_window, app| {
+                        let view = view.read(app);
+                        frames.push(view.frame_time.as_secs_f32() * 1000.0);
+                        walks.push(view.walk_time.as_secs_f32() * 1000.0);
+                    });
+                }
+                let mean = |values: &[f32]| values.iter().sum::<f32>() / values.len() as f32;
+                println!(
+                    "{:<9} {action:<6} frame {:>8.1} ms   walk {:>7.1} ms",
+                    mode.label(),
+                    mean(&frames),
+                    mean(&walks),
+                );
+            }
+        }
+    }
+
+    /// The app puts its windows on a throttled frame pipeline, and a frame asked
+    /// for sooner than the cap allows is deferred rather than dropped: the
+    /// window is left dirty and a later frame draws it.
+    ///
+    /// The cap here is not the app's. A frame of this document costs tens of
+    /// milliseconds even in a debug build, which is already slower than
+    /// `FRAME_CAP` allows, so a test cannot hold a frame back with it — what is
+    /// being tested is that the window is on a throttled pipeline at all, and
+    /// that is the same wiring whatever the rate. The rest is the pipeline's.
+    ///
+    /// It also has to be asked the way the platform asks. `Window::draw` draws
+    /// whatever the pipeline says, because deciding *whether* to draw belongs to
+    /// the requester; the harness's own frame flush is the thing that asks, and
+    /// so the thing a notify is left to.
+    #[gpui::test]
+    fn a_frame_inside_the_cap_is_deferred(cx: &mut TestAppContext) {
+        const TEST_CAP: u32 = 5;
+        let cap = Duration::from_secs_f32(1.0 / TEST_CAP as f32);
+
+        // The same factory the application method forwards to, so this is the
+        // wiring `main` uses.
+        cx.update(|cx| {
+            cx.set_frame_pipeline_factory(Rc::new(|_window_id| {
+                Box::new(StandardImmediatePipeline.max_fps(TEST_CAP))
+            }))
+        });
+        use_parley(cx);
+        let (view, cx) = cx.add_window_view(|_window, _cx| view());
+        cx.simulate_resize(size(px(1000.0), px(700.0)));
+        cx.run_until_parked();
+
+        // What the last *drawn* frame left behind: only a frame that was built
+        // can change it.
+        let drawn = |cx: &mut VisualTestContext| cx.update(|_window, app| view.read(app).walk_time);
+        let ask = |view: &Entity<CoolScroll>, cx: &mut VisualTestContext| {
+            cx.update(|_window, app| view.update(app, |_this, cx| cx.notify()));
+        };
+
+        let first = drawn(cx);
+
+        // Asked for immediately, which is well inside the cap: the frame the
+        // notify asks for should be deferred.
+        ask(&view, cx);
+        assert_eq!(
+            drawn(cx),
+            first,
+            "a frame inside the cap should be deferred, not built"
+        );
+
+        // And asked for once the cap has passed, which should be drawn.
+        std::thread::sleep(cap);
+        ask(&view, cx);
+        let built = drawn(cx);
+        assert_ne!(
+            built, first,
+            "a frame the cap allows should be built, not deferred"
+        );
+    }
+
+    /// Where the document's mode selector draws the cell for `mode`.
+    fn mode_cell(cx: &mut VisualTestContext, mode: Mode) -> Bounds<Pixels> {
+        cx.debug_bounds(mode.key())
+            .expect("the document selector should be rendered")
+    }
+
+    /// How many lines the view lays out for a 1000x700 viewport in `mode`,
+    /// counted the way a frame counts them, and how many triangles the vector
+    /// mode placed for them.
+    struct Walk {
+        lines: usize,
+        triangles: usize,
+    }
+
+    fn walk(cx: &mut VisualTestContext, view: &Entity<CoolScroll>, mode: Mode) -> Walk {
+        cx.update(|window, app| {
+            let view = view.read(app);
+            let triangles = Cell::new(0);
+            let lines = visible_lines(
                 Scene {
                     document: &view.document,
                     motion: &view.motion,
                     settings: &view.settings,
                     mode,
+                    text_system: window.text_system(),
+                    font: window.text_style().font(),
+                    shaped: &view.shaped,
+                    triangles: &triangles,
+                    scale_factor: window.scale_factor(),
                 },
                 size(px(1000.0), px(700.0)),
             )
-            .len()
+            .len();
+            Walk {
+                lines,
+                triangles: triangles.get(),
+            }
         })
     }
 

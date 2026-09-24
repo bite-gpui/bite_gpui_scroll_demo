@@ -12,11 +12,28 @@ Scroll with the wheel or trackpad, or drag the document for a flick.
 - **5. Altitude** sidesteps the problem instead, shrinking the document the way
   ground recedes from a plane. It is mutually exclusive with the others.
 
-The first switch in the panel is not one of the five. **Skeleton text** draws
-every line as bars instead of setting its text — the same document either way,
-since a bar is as wide as the word it stands in for, so the effects can be
-compared without paying to re-shape every line at the size the transform asks
-for, which is where a slow frame goes.
+The panel's first control is not one of the five. It chooses how the document
+itself is painted, among three modes that are the same lines drawn three ways:
+
+- **Text** sets every line at the size the transform asks for, and that size stays
+  *exact*: every glyph's position, and the width of the line, is what the transform
+  asked for. What is rounded is the size the renderer *cuts* a glyph at, because that
+  is the size it caches a glyph by — and a size that changes every frame asks for a
+  fresh cut of every glyph of every line of every frame, and is never asked for
+  anything the atlas already holds. Rounding there is worth 37.6ms a frame of
+  scrolling against 13.9ms, most of what is left being the layout, which a line drawn
+  at a new size does have to be laid out for again.
+- **Skeleton** draws every line as bars instead of setting its text — the same
+  document, since a bar is as wide as the word it stands in for. A bar is a quad,
+  so nothing is shaped or rasterized at all.
+- **Vector** draws the glyphs' own outlines: each one tessellated into triangles
+  once, then scaled to whatever size each line asks for. Nothing is rasterized
+  per frame either — placing a glyph is a multiply per corner of its triangles —
+  so the same work covers any magnification. The readout says how many triangles
+  that came to for the frame.
+
+The three are for comparing what a scroll *feels* like when the text stops being
+the bottleneck: switching modes changes nothing about the motion.
 
 ## Layout
 
@@ -54,6 +71,14 @@ are both set in Plex Sans and nothing falls back. It exists to prove GPUI's text
 SPI can be implemented out of tree, not to be a general text stack — which is
 why it lives in `patches/` as a copy, rather than being depended on where it is.
 
+The **vector** mode is the other route through the same crate: Parley lays the
+line out, then `ParleyTextSystem::glyph_triangles` tessellates a glyph's outline
+into triangles in em units, and the app scales those per line and pushes them
+through `Window::paint_path`. So a frame of text is a multiply per corner of a
+cached triangle and nothing is rasterized at all. The tessellations are cached
+per glyph and per power-of-two size band, which is what keeps one outline serving
+every size a line is drawn at.
+
 The document's position is a `gpui_animotion` property — one of the crate's
 interruptible `Prop`s — rather than a simulation of its own, and every way of
 moving it is one of that crate's segments: a wheel tick tweens to the accumulated
@@ -68,12 +93,25 @@ unmounted or dropped once they have settled, so the app goes quiet at rest. The
 panel's transitions (the switch knob, and controls dimming as they are armed)
 come from `gpui_animotion` as well.
 
-**`bite-gpui/`** is a checkout of `Vanuan/bite-gpui`, sitting on the tip of
-branch `bite_v1.21.0-pre` (`d418335`) — it is unmodified, so `git status` there
-is clean and it can be updated in place. It is a dependency rather than a
-workspace member, so it can also be replaced by a `git` dependency (see the
-comment in `Cargo.toml`) or built against a local edit, without anything of the
-app's riding along.
+**`bite-gpui/`** is a checkout of `Vanuan/bite-gpui`, branched from the tip of
+`bite_v1.21.0-pre` (`d418335`) at **`path-pass-cost`**, which carries this
+repository's three changes to it and nothing else. All three are about what the
+vector path pass costs and are meant for the fork rather than for here — as
+three commits, because the first is a knob for measuring what the pass's
+multisampling costs (`ZED_PATH_SAMPLE_COUNT`), the second is the saving that knob
+made visible (`ZED_PATH_DIRECT`, the pass skipping the target and composite it no
+longer needs), and the third drops the per-corner `ContentMask` a `PathVertex`
+has carried since before the renderers stopped reading it, which halves the
+vertex. The first two are in `gpui_wgpu`; the third is in `gpui_engine`. See the
+section on the vector mode above.
+
+    git -C bite-gpui push -u origin path-pass-cost
+
+The checkout sits on that branch, so `git status` there is clean and each commit
+is independently buildable — the second is the one to stop at if the knob is not
+wanted. It is a dependency rather than a workspace member, so it can also be
+replaced by a `git` dependency (see the comment in `Cargo.toml`) or built against
+a local edit, without anything of the app's riding along.
 
 **`patches/`** holds local copies of the three crates this app cannot take as
 they come: a shim that resolves the published `gpui-unofficial` to the fork's
@@ -83,12 +121,61 @@ here so that changing it is possible. See `patches/README.md`.
 
 ## Running
 
+`bite-gpui/` is not part of this repository — it is a clone of `Vanuan/bite-gpui`,
+and it has to be here because `Cargo.toml` takes GPUI from it by path. Clone it
+beside this tree, on the branch this one is written against:
+
+    git clone --branch path-pass-cost https://github.com/Vanuan/bite-gpui.git bite-gpui
+
+Then:
+
     cargo run --release
 
 The toolchain is pinned to the fork's (`rust-toolchain.toml`), and the first
 build compiles the GPUI stack, so give it a couple of minutes — several more for
 a release build. Release is worth it: this is a motion demo, and in a debug build
 most of each frame goes on laying out and shaping the lines on screen.
+
+The readout in the bottom-left says where a frame goes: `Frame:` is the interval
+between one frame and the next, which is what the display actually got, and
+`walk` is the share of it this app spent building the document's elements. A
+frame whose interval is far larger than its walk is one being paid for
+downstream — by glyph rasterization in the text mode, or by the GPU in the vector
+mode. `patches/gpui_parley`'s `frame_cost` example measures the vector mode's own
+CPU share directly:
+
+    cargo run --release -p gpui_parley --example frame_cost
+
+**The vector mode's GPU cost is the one to look at first, because it is the one
+the other two modes do not have.** Text is drawn as sprites and bars as quads,
+both straight into the frame; a path is rasterized into a target *the size of the
+window*, resolved, and composited back, so what the path pass costs is mostly
+independent of what the paths cover — a screenful of outlines or one progress
+ring, the same. At 4x samples on a 2560x1600 drawable that is 64MB of samples to
+clear and read back every frame, against a few hundred kilobytes of quads. Two
+knobs this repository added to the fork's `gpui_wgpu`, alongside its own
+`ZED_FONTS_*` ones, are how to see what that costs:
+
+    ZED_PATH_SAMPLE_COUNT=1 cargo run --release    # no multisampling: cheapest, jaggier edges
+    ZED_PATH_SAMPLE_COUNT=2 cargo run --release    # half the samples
+    ZED_PATH_DIRECT=0 cargo run --release          # rasterize into the target and composite it
+
+With no multisampling there is nothing to resolve, so `ZED_PATH_DIRECT` stops
+being an optimization and becomes an outright saving: the target exists only as a
+resolve target, and without one it is two window-sized passes — a clear and a
+composite — for whatever the paths cover. The rasterization pipeline already
+blends into a surface-format target, so the paths are drawn straight into the
+frame instead, where their batch sits in the frame's order. `ZED_PATH_DIRECT=0`
+puts the intermediate back, which is what to do if the paths look wrong rather
+than merely jaggy.
+
+The frame rate is *not* capped by default. `FRAME_CAP` in `main.rs` caps it
+through the fork's `ThrottledPipeline` (`Some(30)` and the app draws at 30
+frames a second while the document moves). The motion is time-based rather than
+frame-based, so a cap changes nothing about what a scroll looks like — only how
+many frames it is made of, and therefore what watching one costs. It buys
+steadiness at a lower rate, and nothing at all when the frames themselves are
+what is expensive, which is why it is off.
 
 ## Tests
 
@@ -107,13 +194,35 @@ the distortion fields.
 
 The view's tests live in `main.rs` and drive a real window on the headless
 platform, which is `gpui`'s `test-support`: the document is walked and the wheel
-moves it in the right direction (and the walk finds the same lines in both
+moves it in the right direction (and the walk finds the same lines in all three
 modes), a wheel over the panel leaves the document alone, a switch springs its
 knob across and settles (which exercises the patched animotion element end to
-end), skeleton mode paints bars where the text was, a drag throws the document
-past where the pointer asked it to be, grabbing calls off a flick in flight, the
-corpus loads, parses and wraps, and the app really is shaping its text through
-Parley.
+end), the selector repaints the document as bars and back to text, the vector
+mode places triangles for a screenful and shapes each line once rather than once
+a frame, a drag throws the document past where the pointer asked it to be,
+grabbing calls off a flick in flight, the frame rate cap really is on the
+window's pipeline (a frame asked for inside the cap is deferred, one asked for
+past it is drawn), the corpus loads, parses and wraps, and the app really is
+shaping its text through Parley.
+
+Two of those draw the document as skeleton bars rather than as text. They are
+testing the pointer, and a pointer's speed is measured in wall-clock time: the
+flick a release throws is built from samples taken within a fifth of a second of
+it, and the harness draws a frame between two events. A debug build spends about
+half a second on a screenful of *magnified* text — which a flick has in it — so
+every sample but the last would fall outside that window and the flick would be
+measured as no movement at all, leaving the tests to pass or fail on how fast the
+machine is. Bars cost the same at any magnification.
+
+Where those numbers come from is measurable rather than folklore. One test prints
+them instead of asserting, and is skipped unless asked for:
+
+    cargo test --features test-support -- --ignored --nocapture a_frame
+
+It draws a frame per mode, at rest and with a flick in flight, and reports the
+interval and the walk for each. On a debug build of this repository that comes
+out as about 25ms and 0.1ms for text at rest, 558ms for text mid-flick, 25ms for
+bars either way, and 30ms with a 6.4ms walk for vectors.
 
 That feature is declared by this crate rather than left in `[dev-dependencies]`
 because a dev-dependency's features are unified into every dev-context build:
