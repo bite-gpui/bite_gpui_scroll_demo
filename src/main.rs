@@ -590,6 +590,7 @@ impl Render for CoolScroll {
                 &self.motion,
                 mode,
                 triangles.get(),
+                &resolved_document_font(window.text_system()),
                 self.frame_time,
                 self.walk_time,
                 frame_cap_interval(),
@@ -1090,6 +1091,7 @@ fn readout(
     motion: &Motion,
     mode: Mode,
     triangles: usize,
+    font: &SharedString,
     frame_time: Duration,
     walk_time: Duration,
     cap: Option<Duration>,
@@ -1114,6 +1116,11 @@ fn readout(
             Mode::Vector => format!("Mode: {} ({} triangles)", mode.label(), triangles),
             mode => format!("Mode: {}", mode.label()),
         })
+        // The family the document is really set in — not the request, but what
+        // the shaper's own database resolved it to. Shown so the two text-drawing
+        // modes can be seen to agree: both read it, and a mode that drew the
+        // window's own default face instead would show up as a mismatched line.
+        .child(format!("Font: {font}"))
         // The interval is the last frame as a whole — whatever asked for it, and
         // however far it fell short of the display's rate. The walk is the part
         // of it this file does: the elements' own building, which for the vector
@@ -1258,6 +1265,12 @@ fn line_element(
 
     Some(match scene.mode {
         Mode::Text => element
+            // A div draws its own text, so it has to be told the family: the
+            // other two modes take it from the `document_font` the scene is
+            // built with, and without this the text would fall back to the
+            // window's default face instead — two modes of the same document in
+            // two different fonts. See the readout's `Font` line.
+            .font_family(document_family())
             // The text is set at the size the transform asks for, rather than
             // scaled as a bitmap, so it stays sharp at any magnification. The size
             // is exact: the layout, and so every glyph's position and the line's
@@ -1633,6 +1646,22 @@ fn document_font(base: &TextStyle) -> Font {
     let mut font = base.font();
     font.family = document_family();
     font
+}
+
+/// The family the document is really set in, rather than the one it asks for.
+///
+/// [`document_family`] is the family or stack the app names; this is the concrete
+/// family the shaper's own database resolves that name to — the first family in
+/// the stack it can actually answer with, with a generic standing for whatever the
+/// platform maps it to. It is the useful figure to show, because a stack resolves
+/// to a family the app never wrote down. Without a Parley system there is nothing
+/// to ask, so the request stands.
+fn resolved_document_font(text_system: &WindowTextSystem) -> SharedString {
+    let requested = document_family();
+    text_system
+        .as_parley()
+        .and_then(|parley| parley.resolved_family(&requested))
+        .map_or(requested.clone(), SharedString::from)
 }
 
 /// The faces under `assets/fonts/`, for the text system to shape and cut with.
@@ -2411,6 +2440,42 @@ mod tests {
             faces.len() >= 2 && japanese_faces.iter().all(|face| faces.contains(face)),
             "a mixed line should be shaped from both faces, not {faces:?}"
         );
+    }
+
+    /// The family or stack the document is set in resolves to one real family.
+    ///
+    /// This is what the readout shows, and what makes a stack worth naming: the
+    /// families are tried in order and the answer is the one that will be drawn
+    /// in — a name the shaper can shape, not merely a name that was written down.
+    #[test]
+    fn the_document_font_resolves_to_a_single_family() {
+        let text_system = ParleyTextSystem::new();
+        text_system
+            .add_fonts(loose_fonts())
+            .expect("the fonts under assets/fonts should load");
+
+        let resolved = text_system
+            .resolved_family(&document_family())
+            .expect("the stack ends in a generic, so something always resolves");
+        assert!(
+            !resolved.contains(','),
+            "a stack should resolve to one family, not another list: {resolved}"
+        );
+
+        // And it is a family that can actually be shaped in, rather than one that
+        // merely parses — a name nothing was loaded for would come back empty.
+        let family = SharedString::from(resolved.clone());
+        let run = gpui::FontRun {
+            font_id: text_system.resolve_font(&Font {
+                family,
+                ..Default::default()
+            }),
+            len: 19,
+        };
+        let width = text_system
+            .layout_line("The quick brown fox", px(14.0), &[run], None)
+            .width;
+        assert!(width.0 > 0.0, "{resolved} should shape some width");
     }
 
     /// A family that was never loaded draws the compiled-in one rather than nothing.

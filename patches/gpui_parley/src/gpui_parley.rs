@@ -498,6 +498,15 @@ impl ParleyTextSystem {
         self.platform
             .glyph_triangles(font_id, glyph_id, device_size, max_error)
     }
+
+    /// The family a stack actually resolves to.
+    ///
+    /// The answer to "what font is this, really?" when the name asked for was a
+    /// fallback stack rather than one family — see
+    /// [`ParleyPlatformTextSystem::resolved_family`].
+    pub fn resolved_family(&self, family: &str) -> Option<String> {
+        self.platform.resolved_family(family)
+    }
 }
 
 /// Access to Parley's own layout API from a text system handle.
@@ -1016,6 +1025,36 @@ impl ParleyPlatformTextSystem {
         }
         let font = self.font_for_id(id)?;
         self.font_data_for(&font)
+    }
+
+    /// The family a stack actually resolves to.
+    ///
+    /// Walks the comma-separated names in order, as the shaper does, and answers
+    /// with the first the database can name a *concrete* family for. That is the
+    /// family the text will be set in, and so the honest answer to "what font is
+    /// this?" when the name that was asked for was a fallback stack. A generic
+    /// (`sans-serif`, and the rest) is not a family of its own but whatever this
+    /// platform maps it to, so it answers with the first family it stands for.
+    fn resolved_family(&self, family: &str) -> Option<String> {
+        let mut context = self.font_context.lock().unwrap();
+        let collection = &mut context.collection;
+        for name in family.split(',') {
+            let name = name.trim();
+            if name.is_empty() {
+                continue;
+            }
+            if let Some(generic) = parley::fontique::GenericFamily::parse(name) {
+                let first = collection.generic_families(generic).next();
+                if let Some(resolved) = first.and_then(|id| collection.family_name(id)) {
+                    return Some(resolved.to_string());
+                }
+                continue;
+            }
+            if collection.family_id(name).is_some() {
+                return Some(name.to_string());
+            }
+        }
+        None
     }
 
     /// The hinting instance for a face at a device size, built once and reused.
