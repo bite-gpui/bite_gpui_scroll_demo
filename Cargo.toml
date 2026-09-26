@@ -22,7 +22,7 @@ todo = "deny"
 
 [features]
 # The headless platform, and the paint introspection the view's tests are written
-# against. Opt-in, the way `patches/gpui_parley` opts in.
+# against. Opt-in, the way the text system's own crate opts in.
 #
 # Declared as a feature rather than left in `[dev-dependencies]`, because Cargo
 # unifies a dev-dependency's features into every dev-context build — `cargo
@@ -33,32 +33,46 @@ todo = "deny"
 # not be able to pick it up by accident. The tests that need it are the ones in
 # `src/main.rs`, which is why they take `--features test-support` to run at all;
 # `src/document.rs` and `src/motion.rs` need no window and run either way.
-test-support = ["gpui/test-support"]
+test-support = ["bite-gpui/test-support"]
 
 [dependencies]
-# A checkout of bite-gpui/bite-gpui on the branch
-# bite_v1.21.0-pre-path-pass-cost — that branch, which is the fork's version line
-# for GPUI 1.21, plus this app's four commits, the last of which is
-# 33d8929fba754ea2940865f0dad65ec91bd5f090. To build against the remote instead of
-# the checkout, replace the path with
-# `git = "https://github.com/bite-gpui/bite-gpui", rev = "33d8929fba754ea2940865f0dad65ec91bd5f090"`;
-# the [patch.crates-io] table below is needed either way.
-gpui = { path = "bite-gpui/crates/gpui", default-features = false, features = ["platform"] }
+# Repointed at the published crates: no checkout, no branch, no revision. That is
+# the point of this app — it is a real consumer of the artefact the rearchitecture
+# publishes, rather than of the fork it was written against.
+#
+# Was: `gpui = { path = "bite-gpui/crates/gpui", default-features = false,
+# features = ["platform"] }` against a checkout of
+# bite_v1.21.0-pre-path-pass-cost at 33d8929.
+bite-gpui = { version = "1.21", default-features = false, features = ["platform"] }
 # Resolved to patches/gpui_animotion by [patch.crates-io].
 gpui_animotion = "0.7.0"
-# A copy of this fork's `gpui_parley`, which is what shapes the document's text.
+# What shapes the document's text. It is a second implementation of the SPI rather
+# than a layer of the stack, so it is neither vendored here nor published by the
+# layer stack any more — it has a repository of its own and publishes to crates.io
+# from there. The package is `bite-gp-parley` and the library is `gpui_parley`;
+# cargo exposes a dependency under its library name, so `use gpui_parley::…` in
+# `src/` is unchanged and no `package` rename is needed. `1.21.1` is the first
+# release from that repository and the first with the hinting-instance cache and
+# the host font database.
+#
 # Depended on with no features, so its own `test-support` — which activates its
 # `gpui` dependency and puts gpui on the test draw path — never reaches a build of
-# this app. Its injection test is run on its own:
-# `cargo test -p gpui_parley --features test-support`.
-gpui_parley = { path = "patches/gpui_parley" }
+# this app. Its own tests and examples are run in its repository:
+#
+#     cargo test --features test-support     # in bite-gpui/gpui_parley
+#     cargo run --release --example raster_cost
+#
+bite-gp-parley = "1.21"
 
-# A patch table is not inherited, so the entries that reach gpui's dependency
-# tree are mirrored from bite-gpui's own root manifest, pinned to the revisions
-# it locks. The gpui-unofficial shim and the gpui_animotion patch live here
-# rather than in the fork, so the checkout stays unmodified.
+# The two patches this app owns, rather than ones mirrored from the fork: a shim
+# that resolves the published `gpui-unofficial` to this fork's `gpui`, and
+# `gpui_animotion` with one `Element` signature adapted. Neither is published, so
+# both are local copies under `patches/`.
+#
+# `calloop` and `async-task` used to be here as well, mirrored from the fork's own
+# root manifest, which patches them to revisions it locks. The published crates
+# declare registry versions of both (cargo strips a `[patch]` before packaging), so
+# a consumer of the crates needs neither.
 [patch.crates-io]
 gpui-unofficial = { path = "patches/gpui_unofficial" }
 gpui_animotion = { path = "patches/gpui_animotion" }
-calloop = { git = "https://github.com/zed-industries/calloop", rev = "eb6b4fd17b9af5ecc226546bdd04185391b3e265" }
-async-task = { git = "https://github.com/smol-rs/async-task", rev = "b4486cd71e4e94fbda54ce6302444de14f4d190e" }

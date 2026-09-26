@@ -55,7 +55,8 @@ This app is the facade, plus two of the swaps it is built for:
 
 - **A text system**: Parley for shaping and measuring, Skrifa for glyph outlines,
   tiny-skia for their coverage — installed with `application().with_text_system(...)`
-  from this repository's copy of the fork's `gpui_parley`.
+  from `gpui_parley`, a crate of its own published as `bite-gp-parley`
+  ([`bite-gpui/gpui_parley`](https://github.com/bite-gpui/gpui_parley)).
 - **A frame pipeline**: the fork's `ThrottledPipeline`, which `FRAME_CAP` arms.
 
 ## The five effects
@@ -119,8 +120,8 @@ thing is ~90,000 lines, and the cost is linear in the text). Point
 `load_corpus` at another file to scroll through something else.
 
 The measuring and the rendering both go through Parley — Skrifa for the glyph
-outlines, tiny-skia for their coverage — because `main` installs a copy of the
-fork's `gpui_parley` with `application().with_text_system(...)`. Worth knowing
+outlines, tiny-skia for their coverage — because `main` installs `gpui_parley`
+with `application().with_text_system(...)`. Worth knowing
 what that crate is: it reads its fonts from the shaper's own font database, which
 now includes the host's, so the document can be set in any family this machine
 has. `COOL_SCROLL_FONT` takes a family, or a whole stack — a comma-separated list
@@ -139,7 +140,8 @@ back to the compiled-in family rather than drawing nothing. Dropping a font unde
 that is not installed anywhere nameable. That is enough to see what these effects
 read like in a serif, or a mono, or whatever is to hand. It exists to prove GPUI's
 text SPI can be implemented out of tree, not to be a general text stack — which is
-why it lives in `patches/` as a copy, rather than being depended on where it is.
+why it is a crate of its own rather than a layer of the stack, and is now depended
+on from its repository rather than vendored here.
 
 The **vector** mode is the other route through the same crate: Parley lays the
 line out, then `ParleyTextSystem::glyph_triangles` tessellates a glyph's outline
@@ -192,11 +194,11 @@ wanted. It is a dependency rather than a workspace member, so it can also be
 replaced by a `git` dependency (see the comment in `Cargo.toml`) or built against a
 local edit, without anything of the app's riding along.
 
-**`patches/`** holds local copies of the three crates this app cannot take as
-they come: a shim that resolves the published `gpui-unofficial` to the fork's
-`gpui`, `gpui_animotion` with the one `Element` signature adapted to the fork's
-trait, and `gpui_parley` — which the app *uses* rather than patches, and keeps
-here so that changing it is possible. See `patches/README.md`.
+**`patches/`** holds local copies of the two crates this app cannot take as they
+come: a shim that resolves the published `gpui-unofficial` to the fork's `gpui`,
+and `gpui_animotion` with the one `Element` signature adapted to the fork's trait.
+`gpui_parley`, which used to be a third, is now a crate with a repository of its
+own. See `patches/README.md`.
 
 ## What a frame costs
 
@@ -205,10 +207,10 @@ between one frame and the next, which is what the display actually got, and
 `walk` is the share of it this app spent building the document's elements. A
 frame whose interval is far larger than its walk is one being paid for
 downstream — by glyph rasterization in the text mode, or by the GPU in the vector
-mode. `patches/gpui_parley`'s `frame_cost` example measures the vector mode's own
-CPU share directly:
+mode. `gpui_parley`'s own `frame_cost` example measures the vector mode's CPU
+share directly, from that crate's repository:
 
-    cargo run --release -p gpui_parley --example frame_cost
+    cargo run --release --example frame_cost
 
 **The vector mode's GPU cost is the one to look at first, because it is the one
 the other two modes do not have.** Text is drawn as sprites and bars as quads,
@@ -293,11 +295,11 @@ because a dev-dependency's features are unified into every dev-context build:
 `test-support` moves gpui's frame drawing onto a path that draws every dirty
 window at the end of every `App::update` instead of leaving frames to the
 platform, so a build that is not running tests should not be able to pick it up
-by accident. The same reasoning is written out at length in the manifest of
-`patches/gpui_parley`, whose example would render once per input event if it
-ever saw this feature.
+by accident. The same reasoning is written out at length in
+`gpui_parley`'s own manifest, whose example would render once per input event if
+it ever saw this feature.
 
-The vendored text system has tests of its own:
+That crate has tests of its own, which are run in its repository:
 
-    cargo test -p gpui_parley                          # shaping, rasterization, its caches
-    cargo test -p gpui_parley --features test-support  # ...and that it can be injected
+    cargo test                          # shaping, rasterization, its caches
+    cargo test --features test-support  # ...and that it can be injected

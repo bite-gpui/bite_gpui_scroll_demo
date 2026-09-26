@@ -1408,6 +1408,14 @@ fn vector_path(
                         // there is nothing left for the fragment stage to
                         // evaluate.
                         st_position: SOLID,
+                        // `bite-gp-engine`'s `PathVertex` carries this field and
+                        // its wgpu renderer never reads it: a path is clipped by
+                        // `clipped_bounds()`, and each vertex's copy is dropped,
+                        // which is why the engine's own `push_triangle` writes
+                        // the default too. The branch this app was written
+                        // against had removed the field; a consumer of the
+                        // published crate fills it in.
+                        content_mask: Default::default(),
                     });
                 }
             }
@@ -1715,7 +1723,7 @@ fn main() {
         // Shape and lay out the document through Parley rather than the default
         // engine: `gpui_parley` implements the same `TextSystem` SPI on top of
         // Parley, Skrifa and tiny-skia, with IBM Plex Sans compiled in and the rest
-        // of `assets/fonts/` handed to it above. See `patches/gpui_parley`.
+        // of `assets/fonts/` handed to it above. See `bite-gpui/gpui_parley`.
         .with_text_system(text_system)
         .run(|cx: &mut App| {
             let bounds = Bounds::centered(None, size(px(1280.0), px(800.0)), cx);

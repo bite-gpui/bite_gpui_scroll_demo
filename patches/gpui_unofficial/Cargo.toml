@@ -10,4 +10,4 @@ description = "Resolves the published `gpui-unofficial` dependency to this fork'
 path = "src/gpui_unofficial.rs"
 
 [dependencies]
-gpui = { path = "../../bite-gpui/crates/gpui" }
+gpui = { version = "1.21", package = "bite-gpui" }
